@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent HQ 진행판</title>
+<!-- 빌드 결과(public/index.html)는 CSS·JS를 모두 inline한 단일 파일이다. 서버 CSP(script-src 'unsafe-inline')와 정적 경로 allowlist를 그대로 쓴다 -->
+<script>
+// 첫 페인트 전에 테마와 사이드바 폭을 정한다(이후 변경은 앱이 한다). 저장 키·값은 기존 화면과 같다
+try { var t = localStorage.getItem('agent-hq-dashboard:theme'); } catch (e) {}
+document.documentElement.dataset.theme = (t === 'light' || t === 'dark' ? t === 'light' : !matchMedia('(prefers-color-scheme: dark)').matches) ? 'bumblebee' : 'dark';
+try { var w = Number(localStorage.getItem('agent-hq-dashboard:sidebar-width')); } catch (e) {}
+document.documentElement.style.setProperty('--sidebar-w', Math.min(w >= 200 && w <= 420 ? Math.round(w) : 288, Math.max(200, Math.min(420, innerWidth - 600))) + 'px');
+</script>
+</head>
+<body class="min-h-screen bg-base-200 text-base-content">
+<div id="app"></div>
+<noscript><p class="alert alert-error m-4">JavaScript가 꺼져 있어 내용을 표시할 수 없습니다.</p></noscript>
+<script type="module" src="./src/main.tsx"></script>
+</body>
+</html>

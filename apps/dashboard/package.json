@@ -1,0 +1,26 @@
+{
+  "name": "agent-hq-dashboard",
+  "private": true,
+  "description": "진행판 프론트 빌드 전용. 서버는 python3 server.py이며 Node는 public/index.html(web/ 소스를 inline 단일 파일로 빌드)을 만들 때만 쓴다.",
+  "scripts": {
+    "build": "tsc --noEmit -p web && vite build && node web/check-build.mjs",
+    "typecheck": "tsc --noEmit -p web",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "daisyui": "5.7.50",
+    "tailwindcss": "4.3.3",
+    "vite": "8.3.2",
+    "@tailwindcss/vite": "4.3.3",
+    "vite-plugin-singlefile": "2.3.3",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3",
+    "happy-dom": "20.14.5",
+    "@testing-library/preact": "3.2.4"
+  },
+  "type": "module",
+  "dependencies": {
+    "markdown-it": "15.0.2",
+    "preact": "10.29.8"
+  }
+}

@@ -1,0 +1,53 @@
+/* 진행판 스타일 원본. `pnpm build`가 public/index.html에 inline한다. daisyUI 테마·덮어쓰기는 기존 src/app.css와 같다 */
+@import "tailwindcss" source(none);
+@source "../index.html";
+@source "./";
+/* 테스트·fixture는 화면 소스가 아니다. 테스트 id(w-1 등)에서 클래스가 생겨 산출물이 소스 재빌드와 달라지지 않게 뺀다 */
+@source not "./**/*.test.*";
+/* 밝은 테마는 daisyUI 공식 bumblebee, 어두운 테마는 dark를 그대로 쓴다. <html data-theme>는 head 스크립트가 정한다 */
+@plugin "daisyui" {
+  themes: bumblebee --default, dark --prefersdark;
+  logs: false;
+}
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", sans-serif;
+}
+
+@layer base {
+  [hidden] { display: none !important; }
+  body { -webkit-font-smoothing: antialiased; word-break: keep-all; overflow-wrap: anywhere; }
+}
+
+/* stock bumblebee의 상태색은 밝은 노랑·하늘·초록이라, 그 색을 글자에 쓰는 soft 배지·알림·링크가 흰 배경에서 1.5~2.2:1로 읽기 어렵다.
+   테마 변수와 배경은 그대로 두고, 해당 글자만 같은 테마의 *-content(같은 색상의 진한 톤)로 바꾼다 */
+@layer utilities {
+  [data-theme="bumblebee"] {
+    .badge-soft:is(.badge-warning, .badge-info, .badge-success, .badge-error, .badge-primary) { color: var(--badge-fg); }
+    .alert-soft.alert-warning, .text-warning { color: var(--color-warning-content); }
+    .alert-soft.alert-info, .link-info, .btn-soft.btn-info { color: var(--color-info-content); }
+    .alert-soft.alert-success { color: var(--color-success-content); }
+    .alert-soft.alert-error, .text-error { color: var(--color-error-content); }
+    .text-primary { color: var(--color-primary-content); }
+  }
+}
+
+/* Markdown 본문(lib/md.ts). 카드 안이라 제목은 본문보다 조금만 크게, 표·코드는 좁은 화면에서 자기 안에서만 가로로 스크롤한다 */
+@layer components {
+  .md { min-width: 0; overflow-wrap: anywhere;
+    > :first-child { margin-top: 0; } > :last-child { margin-bottom: 0; }
+    :is(p, ul, ol, pre, blockquote, table, hr) { margin-block: 0.5em; }
+    :is(h1, h2, h3, h4, h5, h6) { margin-block: 0.75em 0.25em; font-weight: 600; line-height: 1.35; }
+    :is(h1, h2) { font-size: 1.0625em; } h3 { font-size: 1em; } :is(h4, h5, h6) { font-size: 0.9375em; color: color-mix(in oklab, var(--color-base-content) 75%, transparent); }
+    ul { list-style: disc; padding-left: 1.25em; } ol { list-style: decimal; padding-left: 1.5em; }
+    li + li, li > :is(ul, ol) { margin-top: 0.15em; }
+    blockquote { border-left: 2px solid var(--color-base-300); padding-left: 0.75em; color: color-mix(in oklab, var(--color-base-content) 70%, transparent); }
+    hr { border-color: var(--color-base-300); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.875em; }
+    :not(pre) > code { border-radius: 0.25rem; background: color-mix(in oklab, var(--color-base-content) 8%, transparent); padding: 0.1em 0.3em; }
+    pre { overflow-x: auto; border-radius: var(--radius-field); border: 1px solid var(--color-base-300); background: var(--color-base-100); padding: 0.5em 0.75em; line-height: 1.5; overflow-wrap: normal; }
+    table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 0.9375em; }
+    :is(th, td) { border: 1px solid var(--color-base-300); padding: 0.25em 0.5em; text-align: left; vertical-align: top; overflow-wrap: normal; min-width: 4em; }
+    th { background: color-mix(in oklab, var(--color-base-content) 5%, transparent); font-weight: 600; }
+  }
+}

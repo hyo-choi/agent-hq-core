@@ -1,0 +1,24 @@
+{
+  "updatedAt": "2026-01-05T10:00:00+09:00",
+  "updatedBy": "demo",
+  "work": [
+    {"title": "예시 작업: 로그인 화면 문구 정리", "status": "진행 중", "state": "open", "remaining": "**남은 일**\n- 문구 검토\n- 스크린샷 비교", "prs": [101]},
+    {"title": "예시 작업: 설정 페이지 접근성 점검", "status": "사용자 확인 대기", "state": "waiting_user", "conclusion": "점검 결과 초안을 정리했습니다."},
+    {"title": "예시 작업: 빌드 경고 제거", "status": "완료", "state": "done", "conclusion": "경고 3건을 제거했습니다.", "verification": "합성 예시 데이터입니다."}
+  ],
+  "questions": [
+    {"q": "예시 질문: 새 기능을 기본으로 켤까요?", "status": "조사 중", "state": "open", "category": "기타", "thread": "예시"}
+  ],
+  "pendingDecisions": [
+    {"title": "예시 결정: A안과 B안 중 선택", "detail": "### 배경\n합성 예시입니다.\n\n### 추천안\nA안(미승인)", "waiting": "결정 전까지 B안 작업은 대기합니다."}
+  ],
+  "resolvedDecisions": [],
+  "globalLimits": ["예시 한계: 이 데이터는 데모용 합성 내용입니다."],
+  "prs": {
+    "101": {"number": 101, "title": "예시 PR", "state": "OPEN", "isDraft": true, "url": "https://example.com/pull/101", "ok": true}
+  },
+  "recommendations": {
+    "updatedAt": "2026-01-05T10:00:00+09:00", "updatedBy": "demo", "note": "합성 예시",
+    "items": [{"id": "rec-demo", "title": "예시 결정부터 확인", "why": "다른 작업이 기다립니다.", "action": "결정 탭을 확인합니다.", "decision": null, "prs": [], "jira": []}]
+  }
+}
