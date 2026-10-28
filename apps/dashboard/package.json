@@ -1,6 +1,7 @@
 {
   "name": "agent-hq-dashboard",
   "private": true,
+  "license": "MIT",
   "description": "진행판 프론트 빌드 전용. 서버는 python3 server.py이며 Node는 public/index.html(web/ 소스를 inline 단일 파일로 빌드)을 만들 때만 쓴다.",
   "scripts": {
     "build": "tsc --noEmit -p web && vite build && node web/check-build.mjs",

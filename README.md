@@ -2,8 +2,6 @@
 
 에이전트에게 맡긴 작업·질문·결정을 한 화면에서 보고, 화면에서 남긴 메시지·숨김 요청을 coordinator 에이전트가 CLI로 처리하는 로컬 진행판이다. 서버는 Python 표준 라이브러리만 쓰고, 화면은 Preact + TypeScript + Vite(daisyUI)로 만든 단일 HTML 파일이다. UI 문구는 한국어다.
 
-> **공개 준비 미확정**: 라이선스와 저작권 표기는 아직 정하지 않았다. 정하기 전에는 LICENSE 파일이 없으며, 재사용 조건이 정해진 것으로 보지 않는다.
-
 ## 요구 사항
 
 - Python 3.11 이상 (서버·CLI, 추가 패키지 없음)
@@ -71,3 +69,7 @@ python3 test_server.py           # 서버·CLI (먼저 pnpm build 필요). 임�
 ## 운영 지침 템플릿 (선택)
 
 `templates/`에는 coordinator 에이전트용 일반 지침 예시(`AGENTS.example.md`)와 작업 문서 양식(`task.md`)이 있다. 진행판 동작은 이 템플릿에 의존하지 않으므로 쓰지 않아도 되고, 필요에 맞게 고쳐 쓴다.
+
+## 라이선스
+
+MIT. 전문은 [LICENSE](LICENSE)를 본다.
