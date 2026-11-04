@@ -563,6 +563,7 @@ describe('App', () => {
     // 서버는 받았고 그 뒤 처리까지 끝났다. 옛 번호를 다시 보내면 새 알림이 나가지 않는다
     snap.flush = { ...snap.flush, recent: [{ flushId: posts[0][1].flushId, status: 'processed', createdAt: old, threadName: 'coord' }] };
     await refresh();
+    expect(document.querySelector('#list [role=alert]')).toBeNull();  // 복구한 그 화면에서 옛 실패 문구를 보이지 않는다
     { const b = await btn('지금 확인 요청'); await act(async () => { fireEvent.click(b); }); }
     await waitFor(() => expect(posts.length).toBe(3));
     expect(posts[2][1].flushId).not.toBe(posts[0][1].flushId);
@@ -583,6 +584,14 @@ describe('App', () => {
     fireEvent.click(screen.getByLabelText('관련 HQ-1 작업 탭에서 보기: 작업 하나'));
     await waitFor(() => expect(document.querySelector('#list [data-item="w-1"]')?.classList.contains('ring-2')).toBe(true));
     expect(sessionStorage.getItem('tab')).toBe('"work"');
+  });
+  it('추천의 관련 항목이 merged PR이면 이유만 안내한다', async () => {
+    snap.data.mergedPrs = { 5: { id: 'pr-5', number: 5, state: 'MERGED', ok: true } };
+    snap.refs['pr-5'] = 'HQ-40';
+    snap.data.recommendations = { items: [{ id: 'rec-m', title: 'merged 관련', related: ['pr-5'] }] };
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText('관련 HQ-40 목록에 없음, 이유 보기'));
+    expect(await screen.findByText(/merged로 확인된 PR이라/)).toBeTruthy();
   });
   it('추천의 관련 항목이 숨김이면 되살리지 않고 이유만 안내한다', async () => {
     snap.data.recommendations = { items: [{ id: 'rec-h', title: '숨김 관련', related: ['d-0000dec1'] }] };
