@@ -19,17 +19,20 @@ FIXTURE = {
 }
 
 
-# 가짜 gh: <root>/gh-plan.json의 {번호: 상태|"fail"}대로 응답하고, 호출마다 <root>/gh-calls에 번호를 남긴다
+# 가짜 gh: <root>/gh-plan.json의 {번호: 상태|"fail"|"MOVED"}대로 응답하고, 호출마다 <root>/gh-calls에 번호를, <root>/gh-repos에 "번호 레포"를 남긴다.
+# 응답 url은 호출한 레포를 따른다. 기본 레포는 기존 합성 url을 유지하고, "MOVED"는 다른 레포의 url을 돌려준다
 FAKE_GH = """#!%s
 import json, os, sys, time
-root = os.environ["HQ_DASH_ROOT"]; n = sys.argv[3]
+root = os.environ["HQ_DASH_ROOT"]; n = sys.argv[3]; repo = sys.argv[sys.argv.index("-R") + 1]
 assert sys.argv[1:3] == ["pr", "view"] and "--json" in sys.argv, sys.argv
 open(os.path.join(root, "gh-calls"), "a").write(n + "\\n")
+open(os.path.join(root, "gh-repos"), "a").write(n + " " + repo + "\\n")
 time.sleep(float(os.environ.get("FAKE_GH_SLEEP", "0")))
 st = json.load(open(os.path.join(root, "gh-plan.json"))).get(n, "fail")
 if st == "fail": sys.exit(1)
-print(json.dumps({"number": int(n), "title": "합성 PR " + n, "state": st, "isDraft": False,
-                  "url": "https://example.com/" + n, "updatedAt": "2026-01-16T00:00:00Z", "mergedAt": None}))
+url = "https://github.com/%%s/pull/%%s" %% ("acme/moved" if st == "MOVED" else repo, n) if repo != os.environ["HQ_GITHUB_REPO"] else "https://example.com/" + n
+print(json.dumps({"number": int(n), "title": "합성 PR " + n, "state": "OPEN" if st == "MOVED" else st, "isDraft": False,
+                  "url": url, "updatedAt": "2026-01-16T00:00:00Z", "mergedAt": None}))
 """ % sys.executable
 
 # 가짜 codex: `codex queue --thread T --message M`만 받는다. 호출 argv를 <root>/codex-calls에 남기고,
@@ -355,6 +358,32 @@ class T(unittest.TestCase):
         self.assertEqual(d["data"]["prs"]["2"]["state"], "OPEN")
         n = len(self.gh_calls()); self.get("/api/dashboard"); time.sleep(0.3)
         self.assertEqual(len(self.gh_calls()), n)                            # 실패 후에도 재시도 억제
+
+    def test_refresh_uses_stored_repo_and_keeps_failed_original(self):
+        other = "https://github.com/acme/other/pull/12"
+        files = "https://github.com/acme/other/pull/15/files"
+        moved, unreadable = "https://github.com/acme/other/pull/13", "http://github.com/acme/other/pull/16"
+        d = rd(self.data)
+        d["prs"] = {"12": {"number": 12, "title": "다른 레포", "state": "OPEN", "url": other, "ok": True},
+                    "13": {"number": 13, "title": "레포 불일치", "state": "OPEN", "url": moved, "ok": True},
+                    "14": {"number": 14, "title": "url 없음", "state": "OPEN", "ok": True},
+                    "15": {"number": 15, "title": "경로 붙은 url", "state": "OPEN", "url": files, "ok": True},
+                    "16": {"number": 16, "title": "읽을 수 없는 url", "state": "OPEN", "url": unreadable, "ok": True}}
+        wr(self.data, d)
+        wr(os.path.join(self.root, "gh-plan.json"), {"12": "MERGED", "13": "MOVED", "14": "OPEN", "15": "OPEN", "16": "MERGED"})
+        subprocess.run([sys.executable, os.path.join(HERE, "refresh_prs.py")], env=self.env, cwd=HERE, check=True, capture_output=True)
+        calls = open(os.path.join(self.root, "gh-repos")).read().split("\n")
+        for call in ("12 acme/other", "13 acme/other", "14 example/repo", "15 acme/other"):
+            self.assertIn(call, calls)
+        self.assertFalse([c for c in calls if c.startswith("16 ")])  # 레포를 읽을 수 없으면 조회하지 않는다
+        prs = rd(self.data)["prs"]
+        self.assertEqual((prs["12"]["url"], prs["12"]["state"], prs["12"]["ok"]), (other, "MERGED", True))
+        self.assertTrue(prs["14"]["ok"])
+        self.assertEqual(prs["15"]["url"], "https://github.com/acme/other/pull/15")
+        # 응답 레포가 다르거나 url을 읽을 수 없으면 마지막 관찰값을 그대로 두고 실패로만 표시한다
+        for n, title, url in (("13", "레포 불일치", moved), ("16", "읽을 수 없는 url", unreadable)):
+            self.assertEqual((prs[n]["title"], prs[n]["state"], prs[n]["url"], prs[n]["ok"]), (title, "OPEN", url, False))
+            self.assertIn("failedAt", prs[n])
 
     def test_refresh_cli_targets_current_data_prs(self):
         self.set_prs({"7": {"number": 7, "state": "OPEN", "ok": True}, "12": {"number": 12, "state": "OPEN", "ok": True}}, self.kst_now())
