@@ -100,13 +100,22 @@ export function App() {
       afterRender(() => { const t2 = find(); t2 ? flash(t2) : toast('항목 위치를 찾지 못했습니다. 목록에서 직접 확인해 주세요.'); });
     });
   }, [refOf]);
+  // 내부 id로 이동한다(메시지 연결·추천 관련 항목). 목록에 없으면 이유만 알리고 숨김·merged를 되돌리지 않는다
+  const revealId = useCallback((id: string) => {
+    if (!snap) return;
+    const r = refOf(id) || '이 항목', x = [...Object.values(items(snap)).flat(), ...resolvedItems(snap)].find(x => x.id === id);  // 결정 완료 카드도 이동 대상(reveal의 flash가 결정 완료 묶음을 펼친다)
+    if (x) return reveal(x);
+    if (Object.values(snap.data.mergedPrs || {}).some(p => p.id === id)) return toast(`${r}은 merged로 확인된 PR이라 PR 목록에서 자동으로 숨겼습니다(원본 기록 유지).`);
+    if (snap.requests.some(q => q.status === 'done' && (q.items || []).some(i => i.id === id))) return toast(`${r}은 삭제 요청으로 진행판에서 숨긴 항목입니다(원본 기록 유지, 화면에서 되살리지 않습니다).`);
+    toast(`${r}은 지금 진행판 목록에 없습니다.`);
+  }, [snap, refOf, reveal]);
 
   // 첫 응답 전·첫 실패 때는 제목과 상태만 보인다(이후 실패는 마지막 내용을 유지한 채 경고만 띄운다)
   if (!snap || !it) return <main class="mx-auto w-full max-w-6xl px-4 pt-5 sm:px-6 lg:px-10 lg:pt-8">
     <p class="text-sm font-medium text-base-content/60">Agent HQ 진행판</p><h1 class="text-2xl font-bold tracking-tight sm:text-3xl">{viewName(tab)}</h1>
     {loadErr ? <div role="alert" class="alert alert-error mt-4">{loadErr}</div> : <p class="mt-1 text-sm text-base-content/60">불러오는 중…</p>}</main>;
   const ctx: AppCtx = { snap, it, pend, refOf, tab, setTab, sel, editSel, isOpen: k => open.has(k), setOpen, filters, setFilters, toast,
-    openDialog: node => setDlg({ node, n: Date.now() }), closeDialog: () => dlgRef.current?.close(), reload: load, reveal, afterRender, alertTick, bumpAlerts, editing, setEditing };
+    openDialog: node => setDlg({ node, n: Date.now() }), closeDialog: () => dlgRef.current?.close(), reload: load, reveal, revealId, afterRender, alertTick, bumpAlerts, editing, setEditing };
   return <Ctx.Provider value={ctx}>
     <Body nav={nav} loadErr={loadErr} loadedAt={loadedAt} anyDetail={[...open].some(k => DETAIL.test(k))} closeDetails={closeDetails} />
     <dialog ref={dlgRef} class="modal modal-bottom sm:modal-middle" onClose={() => setDlg(null)}

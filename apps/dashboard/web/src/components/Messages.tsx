@@ -86,17 +86,9 @@ export const msgLabel = (m: Msg) => `${msgName(m.kind)} ${oneLine(m.text).slice(
 // 메시지 자체 번호(msg-<messageId>)는 복사, 연결 항목 번호는 누르면 그 항목으로 이동한다
 const MsgRef = ({ m }: { m: Msg }) => <RefBtn id={'msg-' + m.messageId} label={msgLabel(m)} />;
 function LinkRef({ t }: { t: MsgLink | null }) {
-  const { refOf, it, snap, toast, reveal } = useApp();
+  const { refOf, revealId } = useApp();
   if (!t || !refOf(t.id)) return null;
-  // 목록에 없으면 이유만 알리고 숨김·merged를 되돌리지 않는다
-  const go = () => {
-    const r = refOf(t.id), x = [...Object.values(it).flat(), ...resolvedItems(snap)].find(x => x.id === t.id);  // 결정 완료 카드도 이동 대상(reveal의 flash가 결정 완료 묶음을 펼친다)
-    if (x) return reveal(x);
-    if (Object.values(snap.data.mergedPrs || {}).some(p => p.id === t.id)) return toast(`${r}은 merged로 확인된 PR이라 PR 목록에서 자동으로 숨겼습니다(원본 기록 유지).`);
-    if (snap.requests.some(q => q.status === 'done' && (q.items || []).some(i => i.id === t.id))) return toast(`${r}은 삭제 요청으로 진행판에서 숨긴 항목입니다(원본 기록 유지).`);
-    toast(`${r}은 지금 진행판 목록에 없습니다.`);
-  };
-  return <span class="inline-flex items-center text-xs text-base-content/60">연결<RefBtn id={t.id} label={'연결 항목 ' + t.label} go={go} /></span>;
+  return <span class="inline-flex items-center text-xs text-base-content/60">연결<RefBtn id={t.id} label={'연결 항목 ' + t.label} go={() => revealId(t.id)} /></span>;
 }
 function MsgItem({ m }: { m: Msg }) {
   const { refOf } = useApp();

@@ -23,7 +23,8 @@ export interface Jira {
   issues?: JiraIssue[]; sprints?: Record<string, Sprint>; sprintField?: string; site?: string; project?: string;
   observedAt?: string; dueSetCount?: number; descriptionFetched?: boolean;
 }
-export interface Rec { id?: string; title: string; why?: string; action?: string; decision?: string | null; prs?: number[]; jira?: string[] }
+// related: coordinator가 명시한 관련 내부 항목 id(w-·q-·d-·pr-…). 화면은 제목·번호에서 추측하지 않는다
+export interface Rec { id?: string; title: string; why?: string; action?: string; decision?: string | null; prs?: number[]; jira?: string[]; related?: string[] }
 export interface Data {
   updatedAt?: string; prsCheckedAt?: string; work?: Work[]; questions?: Question[]; pendingDecisions?: Decision[];
   resolvedDecisions?: ResolvedDecision[]; prs?: Record<string, Pr>; mergedPrs?: Record<string, Pr>;

@@ -568,4 +568,29 @@ describe('App', () => {
     expect(posts[2][1].flushId).not.toBe(posts[0][1].flushId);
     expect(document.querySelector('#list [role=alert]')).toBeNull();
   });
+  // 추천 카드의 관련 항목 바로가기: 명시한 related id만 버튼으로 두고(제목의 HQ 번호에서 추측하지 않음), 기존 reveal로 탭 전환·펼침·강조한다
+  it('추천 카드의 관련 HQ 버튼은 명시 id만 표시하고 그 항목으로 이동한다', async () => {
+    snap.data.recommendations = { updatedAt: new Date().toISOString(), items: [
+      { id: 'rec-a', title: 'HQ-2 결정 먼저', related: ['w-1', 'd-1', 'w-1', 'w-none', 7] },
+      { id: 'rec-b', title: 'HQ-1 이어서 하기' }, { id: 'rec-c', title: '문자열 related', related: 'w-1' }] };
+    snap.refs['rec-a'] = 'HQ-50'; snap.refs['rec-b'] = 'HQ-51'; snap.refs['rec-c'] = 'HQ-52';
+    render(<App />);
+    await screen.findByText('HQ-2 결정 먼저');
+    const ids = (rid: string) => [...screen.getByText(rid).closest('article')!.querySelectorAll('[data-related]')].map(b => b.getAttribute('data-related'));
+    expect(ids('HQ-2 결정 먼저')).toEqual(['w-1', 'd-1']);  // 중복·HQ 번호 없는 id·문자열 아닌 값은 버리고 순서 유지
+    expect(ids('HQ-1 이어서 하기')).toEqual([]);  // related 없음(기존 JSON) → 버튼 숨김
+    expect(ids('문자열 related')).toEqual([]);
+    fireEvent.click(screen.getByLabelText('관련 HQ-1 작업 탭에서 보기: 작업 하나'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="w-1"]')?.classList.contains('ring-2')).toBe(true));
+    expect(sessionStorage.getItem('tab')).toBe('"work"');
+  });
+  it('추천의 관련 항목이 숨김이면 되살리지 않고 이유만 안내한다', async () => {
+    snap.data.recommendations = { items: [{ id: 'rec-h', title: '숨김 관련', related: ['d-0000dec1'] }] };
+    snap.requests = [{ requestId: 'r', status: 'done', items: [{ kind: 'decision', id: 'd-0000dec1', label: 'x' }] }];
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText('관련 HQ-30 목록에 없음, 이유 보기'));
+    expect(await screen.findByText(/삭제 요청으로 진행판에서 숨긴 항목/)).toBeTruthy();
+    expect(sessionStorage.getItem('tab')).not.toBe('"decision"');
+    expect(document.querySelector('[data-item="d-0000dec1"]')).toBeNull();
+  });
 });
