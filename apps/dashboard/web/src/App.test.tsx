@@ -170,6 +170,62 @@ describe('App', () => {
     expect(localStorage.getItem('agent-hq-dashboard:drafts')).toBe('{}');
   });
 
+  it('상세 모두 닫기는 중첩 상세까지 접고 묶음 펼침·입력 초안·선택은 유지하며, 갱신·새로 열기 뒤에도 접혀 있다', async () => {
+    snap.data.work.push({ id: 'w-2', title: '끝난 작업', status: '완료', state: 'done', conclusion: '끝' });
+    snap.messages = [{ messageId: 'a', kind: 'work', itemId: 'w-1', label: '작업 하나', text: '질문', status: 'processed', replies: [{ at: '2026-10-19T17:00:00+09:00', text: '답' }] }];
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('sel', '[["w-1","work"]]');
+    sessionStorage.setItem('open', '["d:w-1","m:w-1","mx:a","workdone","d:w-2","jc:1"]');
+    const { unmount } = render(<App />);
+    const ta = await screen.findByLabelText('후속 질문: 작업 하나') as HTMLTextAreaElement;
+    ta.value = '쓰던 초안'; fireEvent.input(ta);
+    const opened = () => [...document.querySelectorAll('#list details')].filter(d => (d as HTMLDetailsElement).open).length;
+    expect(opened()).toBe(5);  // d:w-1, m:w-1, mx:a(중첩), workdone 묶음, d:w-2
+    const btn = screen.getByText('상세 모두 닫기') as HTMLButtonElement;
+    fireEvent.click(btn);
+    await waitFor(() => expect(opened()).toBe(1));
+    expect((document.querySelector('#list details[open]')!.querySelector('summary')!.textContent)).toContain('완료한 작업');
+    expect(JSON.parse(sessionStorage.getItem('open')!)).toEqual(['workdone', 'jc:1']);
+    expect(btn.disabled).toBe(true);
+    expect([ta.isConnected, ta.value]).toEqual([true, '쓰던 초안']);
+    expect(JSON.parse(localStorage.getItem('agent-hq-dashboard:drafts')!)['w-1'].text).toBe('쓰던 초안');
+    expect(screen.getByText('1개 선택됨')).toBeTruthy();
+    await refresh();
+    expect(opened()).toBe(1);
+    fireEvent.click(screen.getAllByText('후속 질문 · 메시지 1 · 답변 1')[0]);  // 다시 펼치면 버튼이 살아난다
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    unmount(); sessionStorage.setItem('open', '["workdone"]'); render(<App />);
+    expect((await screen.findByText('상세 모두 닫기') as HTMLButtonElement).disabled).toBe(true);
+    expect((await screen.findByLabelText('후속 질문: 작업 하나') as HTMLTextAreaElement).value).toBe('쓰던 초안');  // 새로 열어도 초안 유지
+  });
+
+  it('Shift+X는 상세 모두 닫기와 같고, 입력칸·IME 조합·반복·다른 modifier·Shift 없는 x에서는 동작하지 않는다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('sel', '[["w-1","work"]]'); sessionStorage.setItem('open', '["d:w-1","m:w-1","jc:1"]');
+    render(<App />);
+    const ta = await screen.findByLabelText('후속 질문: 작업 하나') as HTMLTextAreaElement;
+    ta.focus(); ta.value = '쓰던 초안 X'; fireEvent.input(ta);
+    const keep = () => JSON.parse(sessionStorage.getItem('open')!);
+    const k = { key: 'X', code: 'KeyX', shiftKey: true };
+    fireEvent.keyDown(ta, k);  // 입력 중
+    fireEvent.keyDown(document.body, { ...k, isComposing: true });
+    fireEvent.keyDown(document.body, { ...k, keyCode: 229 });
+    fireEvent.keyDown(document.body, { ...k, repeat: true });
+    for (const m of ['ctrlKey', 'metaKey', 'altKey']) fireEvent.keyDown(document.body, { ...k, [m]: true });
+    fireEvent.keyDown(document.body, { key: 'x', code: 'KeyX' });
+    const ce = document.createElement('div'); ce.setAttribute('contenteditable', 'true'); document.body.append(ce);
+    fireEvent.keyDown(ce, k); ce.remove();
+    await refresh();
+    expect(keep()).toEqual(['d:w-1', 'm:w-1', 'jc:1']);
+    expect(screen.getByText('상세 모두 닫기').getAttribute('aria-keyshortcuts')).toBe('Shift+X');
+    fireEvent.keyDown(document.body, { key: 'ㅌ', code: 'KeyX', shiftKey: true });  // 한글 자판
+    await waitFor(() => expect(keep()).toEqual(['jc:1']));
+    expect([ta.isConnected, ta.value, screen.getByText('1개 선택됨').isConnected]).toEqual([true, '쓰던 초안 X', true]);
+    expect(JSON.parse(localStorage.getItem('agent-hq-dashboard:drafts')!)['w-1'].text).toBe('쓰던 초안 X');
+    fireEvent.click(screen.getAllByText('검증 · 남은 일 · PR')[0]);  // 다시 펼친 뒤 영문 Shift+X
+    await waitFor(() => expect(keep()).toContain('d:w-1'));
+    fireEvent.keyDown(document.body, k);
+    await waitFor(() => expect(keep()).toEqual(['jc:1']));
+  });
+
   it('선택·삭제 요청은 대화상자 안 재시도에 같은 requestId를 쓰고, 성공하면 선택을 지운다', async () => {
     sessionStorage.setItem('tab', '"work"');
     sessionStorage.setItem('sel', '[["w-1","work"]]');  // 기존 형식 그대로 복원

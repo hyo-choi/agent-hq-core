@@ -17,6 +17,14 @@ import { JiraTab, Recs, Search, jiraStatuses } from './components/Views';
 import { Badge } from './components/ui';
 
 const FILTERS = ['q', 'fstatus', 'fcat', 'jq', 'jst', 'gq'];
+// 항목 상세(Det·메시지 원문) 펼침 키. 묶음(Fold·Jira Sprint)과 알림 '더 보기'는 목록 구조라 '상세 모두 닫기'에서 그대로 둔다
+const DETAIL = /^(d|m|mx|r):/;
+// '상세 모두 닫기' 단축키 Shift+X. 한글 자판에서는 같은 키가 'ㅌ'로 온다. 입력칸·IME 조합·반복·다른 modifier에서는 동작하지 않는다
+export const isCloseKey = (e: KeyboardEvent) => {
+  const t = e.target as HTMLElement | null;
+  return e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat && !e.isComposing && e.keyCode !== 229 && !e.defaultPrevented
+    && (e.key === 'X' || e.key === 'x' || e.key === 'ㅌ') && !(t?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"])'));
+};
 const SearchIcon = () => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="size-4 opacity-50" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path stroke-linecap="round" d="m20 20-3.5-3.5" /></svg>;
 
 export function App() {
@@ -34,6 +42,10 @@ export function App() {
   const setOpen = useCallback((key: string, on: boolean) => setOpenSet(s => {
     if (s.has(key) === on) return s;
     const n = new Set(s); on ? n.add(key) : n.delete(key); session.set('open', [...n]); return n;
+  }), []);
+  const closeDetails = useCallback(() => setOpenSet(s => {
+    const n = new Set([...s].filter(k => !DETAIL.test(k))); if (n.size === s.size) return s;
+    session.set('open', [...n]); return n;
   }), []);
   const editSel = useCallback((f: (m: Map<string, string>) => void) => setSel(s => { const n = new Map(s); f(n); session.set('sel', [...n]); return n; }), []);
   const setFilters = useCallback((v: Record<string, string>) => setFiltersState(f => { for (const [k, x] of Object.entries(v)) session.set('f:' + k, x); return { ...f, ...v }; }), []);
@@ -65,8 +77,9 @@ export function App() {
     const vis = () => { if (!document.hidden) load(); };
     const hash = () => { const h = location.hash.slice(1); if (isView(h)) { setTabState(h); session.set('tab', h); } };
     const storage = (e: StorageEvent) => { if (e.key === KEYS.alerts || e.key === KEYS.status) bumpAlerts(); };  // 다른 탭에서 확인한 알림을 반영한다
-    document.addEventListener('visibilitychange', vis); addEventListener('hashchange', hash); addEventListener('storage', storage);
-    return () => { clearInterval(iv); document.removeEventListener('visibilitychange', vis); removeEventListener('hashchange', hash); removeEventListener('storage', storage); };
+    const key = (e: KeyboardEvent) => { if (isCloseKey(e)) { e.preventDefault(); closeDetails(); } };
+    document.addEventListener('visibilitychange', vis); addEventListener('hashchange', hash); addEventListener('storage', storage); addEventListener('keydown', key);
+    return () => { clearInterval(iv); document.removeEventListener('visibilitychange', vis); removeEventListener('hashchange', hash); removeEventListener('storage', storage); removeEventListener('keydown', key); };
   }, []);
   useEffect(() => { const fs = after.current.splice(0); for (const f of fs) f(); });  // afterRender: 이번 렌더가 DOM에 반영된 뒤 실행
   useLayoutEffect(() => { const d = dlgRef.current; if (d && dlg && !d.open) d.showModal(); }, [dlg]);
@@ -95,7 +108,7 @@ export function App() {
   const ctx: AppCtx = { snap, it, pend, refOf, tab, setTab, sel, editSel, isOpen: k => open.has(k), setOpen, filters, setFilters, toast,
     openDialog: node => setDlg({ node, n: Date.now() }), closeDialog: () => dlgRef.current?.close(), reload: load, reveal, afterRender, alertTick, bumpAlerts, editing, setEditing };
   return <Ctx.Provider value={ctx}>
-    <Body nav={nav} loadErr={loadErr} loadedAt={loadedAt} />
+    <Body nav={nav} loadErr={loadErr} loadedAt={loadedAt} anyDetail={[...open].some(k => DETAIL.test(k))} closeDetails={closeDetails} />
     <dialog ref={dlgRef} class="modal modal-bottom sm:modal-middle" onClose={() => setDlg(null)}
       onClick={e => { if (e.target === dlgRef.current) dlgRef.current!.close(); }}>{/* 바깥(backdrop)을 누르면 닫는다. Escape는 dialog 기본 동작 */}
       <div class="modal-box max-w-2xl" key={dlg?.n}>{dlg?.node}</div></dialog>
@@ -104,7 +117,7 @@ export function App() {
   </Ctx.Provider>;
 }
 
-function Body({ nav, loadErr, loadedAt }: { nav: { current: HTMLInputElement | null }; loadErr: string; loadedAt: string }) {
+function Body({ nav, loadErr, loadedAt, anyDetail, closeDetails }: { nav: { current: HTMLInputElement | null }; loadErr: string; loadedAt: string; anyDetail: boolean; closeDetails: () => void }) {
   const { snap, it, tab, setTab, pend, sel, filters, setFilters, editSel, openDialog } = useApp(), d = snap.data;
   const alerts = useAlertRows();
   const warn: string[] = [];
@@ -166,7 +179,11 @@ function Body({ nav, loadErr, loadedAt }: { nav: { current: HTMLInputElement | n
             <p class="text-sm font-medium text-base-content/60">Agent HQ 진행판</p>
             <h1 class="text-2xl font-bold tracking-tight sm:text-3xl">{viewName(tab)}</h1>
             <p class="mt-1 text-sm text-base-content/60">{`스냅샷 ${fmt(d.updatedAt)} · PR 조회 ${fmt(d.prsCheckedAt)}${PRR.running ? ' (조회 중)' : ''} · 실시간 연동 아님`}</p>
-          </div></div>
+          </div>
+            {/* 펼친 검증·남은 일·PR·답변·후속 질문·메시지 상세를 모든 탭에서 한 번에 접는다. 입력 초안·선택은 건드리지 않는다 */}
+            <span class="flex items-center gap-1"><button class="btn btn-sm btn-ghost" type="button" disabled={!anyDetail} onClick={closeDetails}
+              title="단축키 Shift+X (입력 중에는 동작하지 않음)" aria-keyshortcuts="Shift+X">상세 모두 닫기</button>
+              <kbd class="kbd kbd-sm" aria-hidden="true" title="단축키 Shift+X">⇧X</kbd></span></div>
           {loadErr ? <div role="alert" class="alert alert-error mt-4">{loadErr}</div> : null}
           {callout.length ? <div class="mt-5 grid gap-3">{callout}</div> : null}
           {warn.length ? <div role="alert" class="alert alert-warning alert-soft mt-4 items-start text-sm"><ul class="grid list-disc gap-1 pl-4">{warn.map(w => <li>{w}</li>)}</ul></div> : null}
