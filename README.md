@@ -38,7 +38,7 @@ cd apps/dashboard && python3 server.py init
 | 이름 | 기본 | 의미 |
 | --- | --- | --- |
 | `HQ_DASH_ROOT` | `~/.local/share/agent-hq-core` | 실행 데이터 루트(`public/data.json`, `private/`, `backups/`) |
-| `HQ_GITHUB_REPO` | 없음 | `owner/name`. 지정하면 `data.prs`의 PR을 `gh pr view`로 읽기 전용 조회(화면 요청 시 5분 간격, 또는 `python3 refresh_prs.py`)하고 PR 링크를 만든다. 저장된 GitHub PR url이 있으면 그 레포로 조회하고, 이 값은 url이 없는 PR에 쓴다. `gh` 로그인이 필요하다 |
+| `HQ_GITHUB_REPO` | 없음 | `owner/name`. 지정하면 `data.prs`의 PR을 `gh pr view`로 읽기 전용 조회(화면 요청 시 5분 간격, 또는 `python3 refresh_prs.py`)하고 PR 링크를 만든다. 저장된 GitHub PR url이 있으면 그 레포로 조회하고, 이 값은 url이 없거나 GitHub가 아닌 url의 PR에 쓴다. `gh` 로그인이 필요하다 |
 | `HQ_JIRA_PROJECT` | 없음 | Jira 프로젝트 키. 지정하면 `import-jira FILE`로 미리 받아 둔 조회 스냅샷 파일을 가져온다(서버가 Jira를 호출하지는 않는다). 형식은 [Jira 스냅샷](#jira-스냅샷)을 본다 |
 | `HQ_ENABLE_CODEX_FLUSH` | 없음 | `1`이면 '지금 확인 요청' 버튼이 등록된 Codex thread에 고정 문구를 `codex queue`로 적재한다(`flush register` 필요) |
 | `HQ_TASKS_DIR` | 없음 | 지정하면 `check`가 그 디렉터리의 task 문서 첫머리 `항목: HQ-n`을 데이터와 대조한다 |
@@ -213,8 +213,8 @@ PY
 
 작업 카드에 PR을 표시하려면 항목의 `prs`에 번호를 넣는다. 파일 내용은 `{"prs": [123]}`이고 명령은 `server.py item set HQ-1 --file prs.json`이다.
 
-- 조회는 `HQ_GITHUB_REPO`를 설정했을 때만 동작한다. 저장된 url이 GitHub PR url이면 그 레포로 조회하고, url이 없거나 GitHub url이 아니면 `HQ_GITHUB_REPO`로 조회한다.
-- 응답의 레포가 저장된 레포와 다르거나 GitHub url의 레포를 읽을 수 없으면 덮어쓰지 않는다. 마지막 관찰값을 남기고 조회 실패로 표시한다. 레포를 옮기거나 이름을 바꾸면 url을 고칠 때까지 실패로 보인다.
+- 조회는 `HQ_GITHUB_REPO`를 설정했을 때만 동작한다. 저장된 url이 GitHub PR url이면 그 레포로 조회하고, url이 없거나 GitHub가 아닌 http(s) url이면 `HQ_GITHUB_REPO`로 조회한다.
+- 응답의 레포가 저장된 레포와 다르거나, 저장된 url의 레포와 번호를 확정할 수 없으면(`https://github.com/owner/name/pull/<키와 같은 번호>` 형식이 아니고 GitHub가 아닌 http(s) url도 아닌 경우) 덮어쓰지 않는다. 마지막 관찰값을 남기고 조회 실패로 표시한다. 레포를 옮기거나 이름을 바꾸면 url을 고칠 때까지 실패로 보인다.
 - 키가 번호뿐이므로 서로 다른 레포의 같은 번호 PR은 함께 등록할 수 없다.
 
 ### Jira 스냅샷

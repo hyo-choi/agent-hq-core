@@ -368,14 +368,21 @@ class T(unittest.TestCase):
                     "13": {"number": 13, "title": "레포 불일치", "state": "OPEN", "url": moved, "ok": True},
                     "14": {"number": 14, "title": "url 없음", "state": "OPEN", "ok": True},
                     "15": {"number": 15, "title": "경로 붙은 url", "state": "OPEN", "url": files, "ok": True},
-                    "16": {"number": 16, "title": "읽을 수 없는 url", "state": "OPEN", "url": unreadable, "ok": True}}
+                    "16": {"number": 16, "title": "읽을 수 없는 url", "state": "OPEN", "url": unreadable, "ok": True},
+                    "17": {"number": 17, "title": "대소문자 host", "state": "OPEN", "url": "https://GitHub.com/acme/other/pull/17", "ok": True},
+                    "18": {"number": 18, "title": "비슷한 host", "state": "OPEN", "url": "https://notgithub.com/acme/other/pull/18", "ok": True},
+                    "19": {"number": 19, "title": "쿼리의 문자열", "state": "OPEN", "url": "https://example.com/mirror?from=github.com", "ok": True}}
+        # GitHub를 가리키지만 레포와 번호를 확정할 수 없는 url: 조회하지 않고 원본을 그대로 둔다
+        bad = {"20": "github.com/acme/other/pull/20", "21": "https://github.com./acme/other/pull/21", "22": "https://www.github.com/acme/other/pull/22",
+               "23": "https://github.com/acme/other/pull/99", "24": "https://user@github.com/acme/other/pull/24", "25": "https://github%2ecom/acme/other/pull/25"}
+        d["prs"].update({n: {"number": int(n), "title": "확정 불가", "state": "OPEN", "url": u, "ok": True} for n, u in bad.items()})
         wr(self.data, d)
-        wr(os.path.join(self.root, "gh-plan.json"), {"12": "MERGED", "13": "MOVED", "14": "OPEN", "15": "OPEN", "16": "MERGED"})
+        wr(os.path.join(self.root, "gh-plan.json"), {"12": "MERGED", "13": "MOVED", "14": "OPEN", "15": "OPEN", "16": "MERGED", "17": "MERGED", "18": "OPEN", "19": "OPEN", **{n: "MERGED" for n in bad}})
         subprocess.run([sys.executable, os.path.join(HERE, "refresh_prs.py")], env=self.env, cwd=HERE, check=True, capture_output=True)
         calls = open(os.path.join(self.root, "gh-repos")).read().split("\n")
-        for call in ("12 acme/other", "13 acme/other", "14 example/repo", "15 acme/other"):
+        for call in ("12 acme/other", "13 acme/other", "14 example/repo", "15 acme/other", "17 acme/other", "18 example/repo", "19 example/repo"):
             self.assertIn(call, calls)
-        self.assertFalse([c for c in calls if c.startswith("16 ")])  # 레포를 읽을 수 없으면 조회하지 않는다
+        self.assertFalse([c for c in calls if c.split(" ")[0] in ("16", *bad)])  # 레포를 확정할 수 없으면 조회하지 않는다
         prs = rd(self.data)["prs"]
         self.assertEqual((prs["12"]["url"], prs["12"]["state"], prs["12"]["ok"]), (other, "MERGED", True))
         self.assertTrue(prs["14"]["ok"])
@@ -384,6 +391,9 @@ class T(unittest.TestCase):
         for n, title, url in (("13", "레포 불일치", moved), ("16", "읽을 수 없는 url", unreadable)):
             self.assertEqual((prs[n]["title"], prs[n]["state"], prs[n]["url"], prs[n]["ok"]), (title, "OPEN", url, False))
             self.assertIn("failedAt", prs[n])
+        for n, url in bad.items():
+            self.assertEqual((prs[n]["title"], prs[n]["state"], prs[n]["url"], prs[n]["ok"]), ("확정 불가", "OPEN", url, False), n)
+        self.assertEqual((prs["17"]["url"], prs["17"]["ok"]), ("https://github.com/acme/other/pull/17", True))
 
     def test_refresh_cli_targets_current_data_prs(self):
         self.set_prs({"7": {"number": 7, "state": "OPEN", "ok": True}, "12": {"number": 12, "state": "OPEN", "ok": True}}, self.kst_now())
