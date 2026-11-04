@@ -14,12 +14,14 @@ export function Card({ x, head, title, lead, leadCls, children }: {
   const { sel, editSel, pend, openDialog } = useApp();
   const isSel = !!x.id && sel.has(x.id), isPend = !!x.id && pend.has(x.id), hasId = !!x.id;
   const ld = lead ?? x.lead;
-  return <article class={'list-row items-start gap-3 px-4 py-4 sm:px-5' + (isSel ? ' bg-primary/5' : '')} data-item={x.id || ''}>
+  // 좁은 폭(<sm)에서는 삭제 요청 버튼을 본문 아래 행(본문 열 오른쪽)으로 내려 본문이 카드 폭을 쓰게 한다. sm 이상은 기존 3열 그대로
+  return <article class={'list-row items-start gap-x-2.5 gap-y-1 px-3 py-4 sm:gap-3 sm:px-5' + (isSel ? ' bg-primary/5' : '')} data-item={x.id || ''}>
     {hasId ? <label class="pt-0.5"><span class="sr-only">선택: {x.label}</span>
       <input type="checkbox" class="checkbox checkbox-sm checkbox-primary" checked={isSel}
         onChange={e => { const on = e.currentTarget.checked; editSel(m => on ? m.set(x.id!, x.kind) : m.delete(x.id!)); }} /></label> : <span />}
     <div class="list-col-grow min-w-0">
-      <div class="mb-1.5 flex flex-wrap items-center gap-1.5">
+      {/* 상태 문구가 긴 배지는 한 줄 고정이면 카드 밖으로 넘쳐 가로 스크롤이 생긴다. 넘칠 때만 배지 안에서 줄바꿈한다(한 줄 배지는 높이 그대로) */}
+      <div class="mb-1.5 flex flex-wrap items-center gap-1.5 [&>.badge]:h-auto [&>.badge]:min-h-5 [&>.badge]:max-w-full [&>.badge]:whitespace-normal [&>.badge]:[overflow-wrap:anywhere]">
         {head ?? <><RefBtn id={x.id} label={x.label} />{x.kind === 'pr' ? <Badge cls={prBadge(x.raw)}>{x.status}</Badge> : <StatusBadge x={x} />}</>}
         {isPend ? <Badge cls="badge-neutral text-base-content">삭제 요청 대기</Badge> : null}
         {hasId ? null : <Badge cls="badge-error">id 없음 · 선택 불가</Badge>}
@@ -28,7 +30,7 @@ export function Card({ x, head, title, lead, leadCls, children }: {
       {ld ? <p class={'mt-1 text-sm text-base-content/75 ' + (leadCls || 'line-clamp-2')}>{ld}</p> : null}
       {children}
     </div>
-    {hasId ? <button class="btn btn-ghost btn-xs text-base-content/60 hover:text-error" type="button" disabled={isPend} aria-label={`삭제 요청: ${x.label}`}
+    {hasId ? <button class="btn btn-ghost btn-sm col-start-2 row-start-2 justify-self-end text-base-content/60 hover:text-error sm:btn-xs sm:col-start-auto sm:row-start-1 sm:justify-self-auto" type="button" disabled={isPend} aria-label={`삭제 요청: ${x.label}`}
       onClick={() => openDialog(<AskDelete list={[{ kind: x.kind, id: x.id!, label: x.label }]} />)}>{isPend ? '요청됨' : '삭제 요청'}</button> : <span />}
   </article>;
 }
