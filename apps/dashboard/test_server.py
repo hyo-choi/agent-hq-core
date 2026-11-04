@@ -374,7 +374,9 @@ class T(unittest.TestCase):
                     "19": {"number": 19, "title": "쿼리의 문자열", "state": "OPEN", "url": "https://example.com/mirror?from=github.com", "ok": True}}
         # GitHub를 가리키지만 레포와 번호를 확정할 수 없는 url: 조회하지 않고 원본을 그대로 둔다
         bad = {"20": "github.com/acme/other/pull/20", "21": "https://github.com./acme/other/pull/21", "22": "https://www.github.com/acme/other/pull/22",
-               "23": "https://github.com/acme/other/pull/99", "24": "https://user@github.com/acme/other/pull/24", "25": "https://github%2ecom/acme/other/pull/25"}
+               "23": "https://github.com/acme/other/pull/99", "24": "https://user@github.com/acme/other/pull/24", "25": "https://github%2ecom/acme/other/pull/25",
+               "26": "https://github.com@evil.example/acme/other/pull/26", "27": "https://github.com\\@evil.example/acme/other/pull/27",
+               "28": "https://user@example.com/28", "29": "https://[bad/acme/other/pull/29", "30": "ftp://github.com/acme/other/pull/30"}
         d["prs"].update({n: {"number": int(n), "title": "확정 불가", "state": "OPEN", "url": u, "ok": True} for n, u in bad.items()})
         wr(self.data, d)
         wr(os.path.join(self.root, "gh-plan.json"), {"12": "MERGED", "13": "MOVED", "14": "OPEN", "15": "OPEN", "16": "MERGED", "17": "MERGED", "18": "OPEN", "19": "OPEN", **{n: "MERGED" for n in bad}})

@@ -214,7 +214,7 @@ PY
 작업 카드에 PR을 표시하려면 항목의 `prs`에 번호를 넣는다. 파일 내용은 `{"prs": [123]}`이고 명령은 `server.py item set HQ-1 --file prs.json`이다.
 
 - 조회는 `HQ_GITHUB_REPO`를 설정했을 때만 동작한다. 저장된 url이 GitHub PR url이면 그 레포로 조회하고, url이 없거나 GitHub가 아닌 http(s) url이면 `HQ_GITHUB_REPO`로 조회한다.
-- 응답의 레포가 저장된 레포와 다르거나, 저장된 url의 레포와 번호를 확정할 수 없으면(`https://github.com/owner/name/pull/<키와 같은 번호>` 형식이 아니고 GitHub가 아닌 http(s) url도 아닌 경우) 덮어쓰지 않는다. 마지막 관찰값을 남기고 조회 실패로 표시한다. 레포를 옮기거나 이름을 바꾸면 url을 고칠 때까지 실패로 보인다.
+- 응답의 레포가 저장된 레포와 다르거나, 저장된 url의 레포와 번호를 확정할 수 없으면(`https://github.com/owner/name/pull/<키와 같은 번호>` 형식이 아니고 GitHub가 아닌 http(s) url도 아닌 경우, 또는 url에 userinfo(`@`)가 있는 경우) 덮어쓰지 않는다. 마지막 관찰값을 남기고 조회 실패로 표시한다. 레포를 옮기거나 이름을 바꾸면 url을 고칠 때까지 실패로 보인다.
 - 키가 번호뿐이므로 서로 다른 레포의 같은 번호 PR은 함께 등록할 수 없다.
 
 ### Jira 스냅샷
