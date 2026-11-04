@@ -170,6 +170,62 @@ describe('App', () => {
     expect(localStorage.getItem('agent-hq-dashboard:drafts')).toBe('{}');
   });
 
+  it('상세 모두 닫기는 중첩 상세까지 접고 묶음 펼침·입력 초안·선택은 유지하며, 갱신·새로 열기 뒤에도 접혀 있다', async () => {
+    snap.data.work.push({ id: 'w-2', title: '끝난 작업', status: '완료', state: 'done', conclusion: '끝' });
+    snap.messages = [{ messageId: 'a', kind: 'work', itemId: 'w-1', label: '작업 하나', text: '질문', status: 'processed', replies: [{ at: '2026-10-19T17:00:00+09:00', text: '답' }] }];
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('sel', '[["w-1","work"]]');
+    sessionStorage.setItem('open', '["d:w-1","m:w-1","mx:a","workdone","d:w-2","jc:1"]');
+    const { unmount } = render(<App />);
+    const ta = await screen.findByLabelText('후속 질문: 작업 하나') as HTMLTextAreaElement;
+    ta.value = '쓰던 초안'; fireEvent.input(ta);
+    const opened = () => [...document.querySelectorAll('#list details')].filter(d => (d as HTMLDetailsElement).open).length;
+    expect(opened()).toBe(5);  // d:w-1, m:w-1, mx:a(중첩), workdone 묶음, d:w-2
+    const btn = screen.getByText('상세 모두 닫기') as HTMLButtonElement;
+    fireEvent.click(btn);
+    await waitFor(() => expect(opened()).toBe(1));
+    expect((document.querySelector('#list details[open]')!.querySelector('summary')!.textContent)).toContain('완료한 작업');
+    expect(JSON.parse(sessionStorage.getItem('open')!)).toEqual(['workdone', 'jc:1']);
+    expect(btn.disabled).toBe(true);
+    expect([ta.isConnected, ta.value]).toEqual([true, '쓰던 초안']);
+    expect(JSON.parse(localStorage.getItem('agent-hq-dashboard:drafts')!)['w-1'].text).toBe('쓰던 초안');
+    expect(screen.getByText('1개 선택됨')).toBeTruthy();
+    await refresh();
+    expect(opened()).toBe(1);
+    fireEvent.click(screen.getAllByText('후속 질문 · 메시지 1 · 답변 1')[0]);  // 다시 펼치면 버튼이 살아난다
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    unmount(); sessionStorage.setItem('open', '["workdone"]'); render(<App />);
+    expect((await screen.findByText('상세 모두 닫기') as HTMLButtonElement).disabled).toBe(true);
+    expect((await screen.findByLabelText('후속 질문: 작업 하나') as HTMLTextAreaElement).value).toBe('쓰던 초안');  // 새로 열어도 초안 유지
+  });
+
+  it('Shift+X는 상세 모두 닫기와 같고, 입력칸·IME 조합·반복·다른 modifier·Shift 없는 x에서는 동작하지 않는다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('sel', '[["w-1","work"]]'); sessionStorage.setItem('open', '["d:w-1","m:w-1","jc:1"]');
+    render(<App />);
+    const ta = await screen.findByLabelText('후속 질문: 작업 하나') as HTMLTextAreaElement;
+    ta.focus(); ta.value = '쓰던 초안 X'; fireEvent.input(ta);
+    const keep = () => JSON.parse(sessionStorage.getItem('open')!);
+    const k = { key: 'X', code: 'KeyX', shiftKey: true };
+    fireEvent.keyDown(ta, k);  // 입력 중
+    fireEvent.keyDown(document.body, { ...k, isComposing: true });
+    fireEvent.keyDown(document.body, { ...k, keyCode: 229 });
+    fireEvent.keyDown(document.body, { ...k, repeat: true });
+    for (const m of ['ctrlKey', 'metaKey', 'altKey']) fireEvent.keyDown(document.body, { ...k, [m]: true });
+    fireEvent.keyDown(document.body, { key: 'x', code: 'KeyX' });
+    const ce = document.createElement('div'); ce.setAttribute('contenteditable', 'true'); document.body.append(ce);
+    fireEvent.keyDown(ce, k); ce.remove();
+    await refresh();
+    expect(keep()).toEqual(['d:w-1', 'm:w-1', 'jc:1']);
+    expect(screen.getByText('상세 모두 닫기').getAttribute('aria-keyshortcuts')).toBe('Shift+X');
+    fireEvent.keyDown(document.body, { key: 'ㅌ', code: 'KeyX', shiftKey: true });  // 한글 자판
+    await waitFor(() => expect(keep()).toEqual(['jc:1']));
+    expect([ta.isConnected, ta.value, screen.getByText('1개 선택됨').isConnected]).toEqual([true, '쓰던 초안 X', true]);
+    expect(JSON.parse(localStorage.getItem('agent-hq-dashboard:drafts')!)['w-1'].text).toBe('쓰던 초안 X');
+    fireEvent.click(screen.getAllByText('검증 · 남은 일 · PR')[0]);  // 다시 펼친 뒤 영문 Shift+X
+    await waitFor(() => expect(keep()).toContain('d:w-1'));
+    fireEvent.keyDown(document.body, k);
+    await waitFor(() => expect(keep()).toEqual(['jc:1']));
+  });
+
   it('선택·삭제 요청은 대화상자 안 재시도에 같은 requestId를 쓰고, 성공하면 선택을 지운다', async () => {
     sessionStorage.setItem('tab', '"work"');
     sessionStorage.setItem('sel', '[["w-1","work"]]');  // 기존 형식 그대로 복원
@@ -490,5 +546,60 @@ describe('App', () => {
     const inboxFlush = [...document.querySelectorAll('#list button')].find(b => b.textContent === '지금 확인 요청') as HTMLButtonElement;
     expect(inboxFlush.disabled).toBe(true);
     expect(document.querySelectorAll('h3[id]').length).toBe(new Set([...document.querySelectorAll('h3[id]')].map(h => h.id)).size);  // 두 곳에 있어도 id 중복 없음
+  });
+
+  it('확인 요청 응답만 잃으면 같은 번호로 재시도하고, 서버 기록이 보이면 다음 요청은 새 번호를 쓴다', async () => {
+    const old = new Date(Date.now() - 120_000).toISOString();
+    snap.flush = { registration: { threadName: 'coord', registeredAt: old }, recent: [], cooldownSec: 60 };
+    render(<App />);
+    await screen.findAllByText('Agent HQ');
+    await act(async () => { fireEvent.click(tabBtn('요청함')); });
+    const btn = (label: string) => waitFor(() => { const b = [...document.querySelectorAll('#list button')].find(b => b.textContent === label) as HTMLButtonElement; expect(b?.disabled).toBe(false); return b; });
+    postFail = 2;
+    { const b = await btn('지금 확인 요청'); await act(async () => { fireEvent.click(b); }); }
+    { const b = await btn('다시 시도'); await act(async () => { fireEvent.click(b); }); }
+    await waitFor(() => expect(posts.length).toBe(2));
+    expect(posts[1][1].flushId).toBe(posts[0][1].flushId);
+    // 서버는 받았고 그 뒤 처리까지 끝났다. 옛 번호를 다시 보내면 새 알림이 나가지 않는다
+    snap.flush = { ...snap.flush, recent: [{ flushId: posts[0][1].flushId, status: 'processed', createdAt: old, threadName: 'coord' }] };
+    await refresh();
+    expect(document.querySelector('#list [role=alert]')).toBeNull();  // 복구한 그 화면에서 옛 실패 문구를 보이지 않는다
+    { const b = await btn('지금 확인 요청'); await act(async () => { fireEvent.click(b); }); }
+    await waitFor(() => expect(posts.length).toBe(3));
+    expect(posts[2][1].flushId).not.toBe(posts[0][1].flushId);
+    expect(document.querySelector('#list [role=alert]')).toBeNull();
+  });
+  // 추천 카드의 관련 항목 바로가기: 명시한 related id만 버튼으로 두고(제목의 HQ 번호에서 추측하지 않음), 기존 reveal로 탭 전환·펼침·강조한다
+  it('추천 카드의 관련 HQ 버튼은 명시 id만 표시하고 그 항목으로 이동한다', async () => {
+    snap.data.recommendations = { updatedAt: new Date().toISOString(), items: [
+      { id: 'rec-a', title: 'HQ-2 결정 먼저', related: ['w-1', 'd-1', 'w-1', 'w-none', 7] },
+      { id: 'rec-b', title: 'HQ-1 이어서 하기' }, { id: 'rec-c', title: '문자열 related', related: 'w-1' }] };
+    snap.refs['rec-a'] = 'HQ-50'; snap.refs['rec-b'] = 'HQ-51'; snap.refs['rec-c'] = 'HQ-52';
+    render(<App />);
+    await screen.findByText('HQ-2 결정 먼저');
+    const ids = (rid: string) => [...screen.getByText(rid).closest('article')!.querySelectorAll('[data-related]')].map(b => b.getAttribute('data-related'));
+    expect(ids('HQ-2 결정 먼저')).toEqual(['w-1', 'd-1']);  // 중복·HQ 번호 없는 id·문자열 아닌 값은 버리고 순서 유지
+    expect(ids('HQ-1 이어서 하기')).toEqual([]);  // related 없음(기존 JSON) → 버튼 숨김
+    expect(ids('문자열 related')).toEqual([]);
+    fireEvent.click(screen.getByLabelText('관련 HQ-1 작업 탭에서 보기: 작업 하나'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="w-1"]')?.classList.contains('ring-2')).toBe(true));
+    expect(sessionStorage.getItem('tab')).toBe('"work"');
+  });
+  it('추천의 관련 항목이 merged PR이면 이유만 안내한다', async () => {
+    snap.data.mergedPrs = { 5: { id: 'pr-5', number: 5, state: 'MERGED', ok: true } };
+    snap.refs['pr-5'] = 'HQ-40';
+    snap.data.recommendations = { items: [{ id: 'rec-m', title: 'merged 관련', related: ['pr-5'] }] };
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText('관련 HQ-40 목록에 없음, 이유 보기'));
+    expect(await screen.findByText(/merged로 확인된 PR이라/)).toBeTruthy();
+  });
+  it('추천의 관련 항목이 숨김이면 되살리지 않고 이유만 안내한다', async () => {
+    snap.data.recommendations = { items: [{ id: 'rec-h', title: '숨김 관련', related: ['d-0000dec1'] }] };
+    snap.requests = [{ requestId: 'r', status: 'done', items: [{ kind: 'decision', id: 'd-0000dec1', label: 'x' }] }];
+    render(<App />);
+    fireEvent.click(await screen.findByLabelText('관련 HQ-30 목록에 없음, 이유 보기'));
+    expect(await screen.findByText(/삭제 요청으로 진행판에서 숨긴 항목/)).toBeTruthy();
+    expect(sessionStorage.getItem('tab')).not.toBe('"decision"');
+    expect(document.querySelector('[data-item="d-0000dec1"]')).toBeNull();
   });
 });

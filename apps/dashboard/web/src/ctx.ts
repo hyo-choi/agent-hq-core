@@ -14,7 +14,7 @@ export interface AppCtx {
   toast: (msg: string, kind?: 'ok' | 'err') => void;
   openDialog: (node: ComponentChildren) => void; closeDialog: () => void;
   reload: () => Promise<void>;
-  reveal: (x: Item) => void; afterRender: (f: () => void) => void;
+  reveal: (x: Item) => void; revealId: (id: string) => void; afterRender: (f: () => void) => void;
   alertTick: number; bumpAlerts: () => void;
   // 입력 중인 Composer의 초안 키. 그동안 목록 배치(묶음·순서)를 고정해 카드가 다른 부모로 옮겨지며 다시 만들어지지 않게 한다
   editing: string | null; setEditing: (k: string | null | ((cur: string | null) => string | null)) => void;

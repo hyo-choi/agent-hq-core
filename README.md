@@ -38,8 +38,8 @@ cd apps/dashboard && python3 server.py init
 | 이름 | 기본 | 의미 |
 | --- | --- | --- |
 | `HQ_DASH_ROOT` | `~/.local/share/agent-hq-core` | 실행 데이터 루트(`public/data.json`, `private/`, `backups/`) |
-| `HQ_GITHUB_REPO` | 없음 | `owner/name`. 지정하면 `data.prs`의 PR을 `gh pr view`로 읽기 전용 조회(화면 요청 시 5분 간격, 또는 `python3 refresh_prs.py`)하고 PR 링크를 만든다. `gh` 로그인이 필요하다 |
-| `HQ_JIRA_PROJECT` | 없음 | Jira 프로젝트 키. 지정하면 `import-jira FILE`로 미리 받아 둔 조회 스냅샷 파일을 가져온다(서버가 Jira를 호출하지는 않는다) |
+| `HQ_GITHUB_REPO` | 없음 | `owner/name`. 지정하면 `data.prs`의 PR을 `gh pr view`로 읽기 전용 조회(화면 요청 시 5분 간격, 또는 `python3 refresh_prs.py`)하고 PR 링크를 만든다. 저장된 GitHub PR url이 있으면 그 레포로 조회하고, 이 값은 url이 없거나 GitHub가 아닌 url의 PR에 쓴다. `gh` 로그인이 필요하다 |
+| `HQ_JIRA_PROJECT` | 없음 | Jira 프로젝트 키. 지정하면 `import-jira FILE`로 미리 받아 둔 조회 스냅샷 파일을 가져온다(서버가 Jira를 호출하지는 않는다). 형식은 [Jira 스냅샷](#jira-스냅샷)을 본다 |
 | `HQ_ENABLE_CODEX_FLUSH` | 없음 | `1`이면 '지금 확인 요청' 버튼이 등록된 Codex thread에 고정 문구를 `codex queue`로 적재한다(`flush register` 필요) |
 | `HQ_TASKS_DIR` | 없음 | 지정하면 `check`가 그 디렉터리의 task 문서 첫머리 `항목: HQ-n`을 데이터와 대조한다 |
 | `CODEX_HOME`, `HQ_CODEX_BIN` | `~/.codex`, `codex` | Codex 알림을 켰을 때만 쓴다 |
@@ -85,10 +85,11 @@ hq summary --markdown
   set -a; . /path/to/agent-hq-core/.env; set +a
   python3 /path/to/agent-hq-core/apps/dashboard/server.py <명령>
 - 시작할 때와 작업 경계마다 summary --markdown, msg list, list를 실행해 미완료 항목과 화면 요청을 확인한다.
-- 작업·질문·결정은 item add/set/resolve로만 기록한다. data.json을 직접 편집하지 않는다.
-- 화면 메시지는 msg read로 원문을 읽고, 처리한 뒤 msg respond로 답하고 msg process로 처리 기록을 남긴다.
+- 작업·질문·결정은 item add/set/resolve로만 기록한다. data.json을 직접 편집하지 않는다. 추천과 PR 등록은 README의 '추천과 PR 등록' 절차로만 쓴다.
+- 화면 메시지는 msg read로 원문을 읽고, 처리한 뒤 msg respond로 답하고 msg process로 처리 기록을 남긴다. 실행할 요청은 기존 또는 새 항목에 연결해 자유 메시지에만 남기지 않는다.
 - 숨김 요청은 list로 확인하고 맞으면 process-inbox --request <id>, 아니면 reject로 거절한다.
 - 결정은 사용자의 명시적 답변이 있을 때만 item resolve로 해소한다. 메시지 처리·숨김은 업무 완료나 승인이 아니다.
+- 작업이 정상 진행되지 않으면 원인을 조사하고 안전한 복구를 시도한 뒤 근거와 함께 보고한다. 재시도는 접근을 바꿀 때만 한다.
 - 명령 형식이 불확실하면 server.py <명령> --help를 먼저 본다.
 ```
 
@@ -154,6 +155,116 @@ python3 server.py --help                    # 전체 명령
 
 - 항목 상태는 `state`(`open`·`blocked`·`waiting_user`·`done`·`closed`·`dropped`)로 기록한다. 모든 쓰기는 하나의 파일 락 아래 원자적으로 하며, 그날 첫 쓰기 전에 `backups/`에 스냅샷을 만든다.
 - 화면의 메시지·숨김 요청·확인 요청은 서버가 보관만 한다. 승인·처리는 coordinator가 CLI로 한다. 웹에서 셸 명령을 실행하는 경로는 없다.
+
+## 명령이 없는 데이터 쓰기
+
+`item` 명령은 작업·질문·결정만 쓴다. 다음 할 일 추천과 PR 목록은 전용 명령이 없으므로, `data.json`을 편집기로 고치지 말고 아래처럼 파일 락 아래에서 해당 키만 바꾼다. 편집기로 직접 고치면 PR 자동 조회의 쓰기와 엇갈릴 수 있다. 모든 예시는 `apps/dashboard`에서 실행한다.
+
+### 추천과 PR 등록
+
+**다음 할 일 추천(`data.recommendations`).** 홈 화면에 순서대로 최대 5개를 표시한다. coordinator가 직접 관리하는 데이터이며 자동으로 만들어지거나 항목 상태와 동기화되지 않는다.
+
+```json
+{
+  "updatedBy": "coordinator",
+  "note": "오늘 기준 추천",
+  "items": [{
+    "id": "rec-login",
+    "title": "로그인 수정 PR부터 확인",
+    "why": "다른 작업이 기다린다",
+    "action": "PR을 확인한다",
+    "decision": null,
+    "prs": [123],
+    "jira": ["PROJ-1"],
+    "related": ["w-1a2b3c4d"]
+  }]
+}
+```
+
+```sh
+python3 - recs.json <<'PY'
+import json, sys
+from server import DATA, load_json, locked, now, write_json
+with open(sys.argv[1], encoding="utf-8") as f:
+    recs = json.load(f)
+recs["updatedAt"] = now()
+with locked():
+    data = load_json(DATA)
+    data["recommendations"] = recs
+    write_json(DATA, data)
+PY
+```
+
+- `decision`에 내용을 적으면 "사용자 결정 필요"로 표시한다. 필요 없으면 `null`이다.
+- `related`(선택)는 관련 항목의 내부 id(`w-`, `q-`, `d-`, `pr-<번호>`) 목록이다. 카드의 버튼을 누르면 해당 항목으로 이동한다. 제목에서 추측하지 않으므로 `server.py lookup HQ-n`으로 확인한 id를 적는다. 숨김이나 merged로 목록에 없는 항목은 이유만 안내하고 되살리지 않는다.
+- `prs`가 있고 모두 조회 성공·merged이면 끝난 추천으로 보고 카드에서 뺀다. 그 밖의 추천은 coordinator가 정리한다. 추천을 눌러도 이동만 하며 작업을 시작하지 않는다.
+
+**PR 등록(`data.prs`).** 키는 PR 번호 문자열이다. 등록하면 다음 조회부터 포함된다.
+
+```sh
+python3 - <<'PY'
+from server import DATA, load_json, locked, write_json
+with locked():
+    data = load_json(DATA)
+    data.setdefault("prs", {})["123"] = {"number": 123, "title": "로그인 오류 수정", "state": "OPEN", "url": "https://github.com/owner/name/pull/123"}
+    write_json(DATA, data)
+PY
+```
+
+작업 카드에 PR을 표시하려면 항목의 `prs`에 번호를 넣는다. 파일 내용은 `{"prs": [123]}`이고 명령은 `server.py item set HQ-1 --file prs.json`이다.
+
+- 조회는 `HQ_GITHUB_REPO`를 설정했을 때만 동작한다. 저장된 url이 GitHub PR url이면 그 레포로 조회하고, url이 없거나 GitHub가 아닌 http(s) url이면 `HQ_GITHUB_REPO`로 조회한다.
+- 응답의 레포가 저장된 레포와 다르거나, 저장된 url의 레포와 번호를 확정할 수 없으면(`https://github.com/owner/name/pull/<키와 같은 번호>` 형식이 아니고 GitHub가 아닌 http(s) url도 아닌 경우, 또는 url에 userinfo(`@`)가 있는 경우) 덮어쓰지 않는다. 마지막 관찰값을 남기고 조회 실패로 표시한다. 레포를 옮기거나 이름을 바꾸면 url을 고칠 때까지 실패로 보인다.
+- 키가 번호뿐이므로 서로 다른 레포의 같은 번호 PR은 함께 등록할 수 없다.
+
+### Jira 스냅샷
+
+서버는 Jira를 호출하지 않는다. 사용자가 조회한 결과를 아래 형식으로 저장해 `HQ_JIRA_PROJECT=PROJ python3 server.py import-jira jira.json`으로 가져온다. 시간이 지나도 관찰 시각은 그대로이며, 새로 조회하면 같은 명령을 다시 실행한다.
+
+```json
+{
+  "observedAt": "2026-01-05T10:00:00+09:00",
+  "site": "https://example.atlassian.net",
+  "scope": "project = PROJ AND assignee = currentUser() AND statusCategory != Done",
+  "isLast": true,
+  "sprintField": "customfield_10001",
+  "issues": [{
+    "key": "PROJ-1",
+    "summary": "로그인 문구 수정",
+    "status": "IN PROGRESS",
+    "priority": "High",
+    "project": "PROJ",
+    "due": null,
+    "issueType": "Story",
+    "isSubtask": false,
+    "parentKey": null,
+    "sprints": [{"id": 1, "name": "Sprint 1", "state": "active", "startDate": "2026-01-01", "endDate": "2026-01-14"}]
+  }]
+}
+```
+
+- 다음과 같은 스냅샷은 통째로 거절하며 기존 `data.jira`를 유지한다.
+  - `isLast`가 `true`가 아닌 부분 조회 결과.
+  - `site`가 `https://<이름>.atlassian.net` 형식이 아닌 경우.
+  - `sprintField`(실제 확인한 Sprint 필드 ID, `customfield_<숫자>`)나 `observedAt`을 읽을 수 없는 경우.
+  - `HQ_JIRA_PROJECT` 이외 프로젝트의 티켓이 섞인 경우.
+  - 티켓에 `sprints` 목록이 없는 경우. 빈 목록만 "Sprint 없음"으로 본다.
+- `isSubtask`·`issueType`·`parentKey`는 함께 쓰는 선택 필드다. 없으면 "유형 미확인"으로 표시한다.
+- 화면용 데이터에는 최소 필드만 저장한다. 그 밖의 필드와 계정 정보는 옮기지 않는다.
+
+## 백업과 복원 점검
+
+- 모든 쓰기는 그날 완료된 백업이 없으면 쓰기 직전에 `backups/`에 스냅샷을 만든다. `python3 server.py backup`으로 수동 실행도 할 수 있다. 자동 삭제는 없으며, 같은 디스크에 저장하므로 디스크 고장에는 대비하지 못한다.
+- 복원 점검은 다음 명령으로 하며 **운영 데이터를 바꾸지 않는다.**
+
+```sh
+python3 server.py restore --backup "$HQ_DASH_ROOT/backups/<이름>" --out <비어 있는 새 디렉터리>
+```
+
+- 백업의 무결성을 확인한 뒤 현재 파일과 병합한 결과를 출력 디렉터리의 `public/data.json`, `private/*.json`, `restore-report.json`에 만든다.
+- 백업 파일의 크기나 해시가 manifest와 다르거나 병합 충돌이 있으면 중단한다.
+- 현재 파일이 없거나 손상됐으면 중단하지 않고 백업 값으로 결과를 만든다. 백업 이후의 변경은 복구되지 않을 수 있으며, 그 내용을 `restore-report.json`의 `currentProblems`와 `notes`에 남긴다. 정상 종료만 보지 말고 보고서를 확인한다.
+- 실제 반영은 이 명령이 하지 않는다. 보고서를 확인한 뒤 서버를 멈추고 별도로 진행한다.
 
 ## 보안 모델
 

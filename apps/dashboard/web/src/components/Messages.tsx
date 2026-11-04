@@ -86,17 +86,9 @@ export const msgLabel = (m: Msg) => `${msgName(m.kind)} ${oneLine(m.text).slice(
 // 메시지 자체 번호(msg-<messageId>)는 복사, 연결 항목 번호는 누르면 그 항목으로 이동한다
 const MsgRef = ({ m }: { m: Msg }) => <RefBtn id={'msg-' + m.messageId} label={msgLabel(m)} />;
 function LinkRef({ t }: { t: MsgLink | null }) {
-  const { refOf, it, snap, toast, reveal } = useApp();
+  const { refOf, revealId } = useApp();
   if (!t || !refOf(t.id)) return null;
-  // 목록에 없으면 이유만 알리고 숨김·merged를 되돌리지 않는다
-  const go = () => {
-    const r = refOf(t.id), x = [...Object.values(it).flat(), ...resolvedItems(snap)].find(x => x.id === t.id);  // 결정 완료 카드도 이동 대상(reveal의 flash가 결정 완료 묶음을 펼친다)
-    if (x) return reveal(x);
-    if (Object.values(snap.data.mergedPrs || {}).some(p => p.id === t.id)) return toast(`${r}은 merged로 확인된 PR이라 PR 목록에서 자동으로 숨겼습니다(원본 기록 유지).`);
-    if (snap.requests.some(q => q.status === 'done' && (q.items || []).some(i => i.id === t.id))) return toast(`${r}은 삭제 요청으로 진행판에서 숨긴 항목입니다(원본 기록 유지).`);
-    toast(`${r}은 지금 진행판 목록에 없습니다.`);
-  };
-  return <span class="inline-flex items-center text-xs text-base-content/60">연결<RefBtn id={t.id} label={'연결 항목 ' + t.label} go={go} /></span>;
+  return <span class="inline-flex items-center text-xs text-base-content/60">연결<RefBtn id={t.id} label={'연결 항목 ' + t.label} go={() => revealId(t.id)} /></span>;
 }
 function MsgItem({ m }: { m: Msg }) {
   const { refOf } = useApp();
@@ -179,8 +171,10 @@ const FLUSH_ST: Record<string, [string, string]> = { sending: ['전송 중', 'ba
 function FlushCard() {
   const { snap, toast, reload } = useApp(), FL = snap.flush;
   const [, rerender] = useState(0), hid = useId(); useShared();
-  const err = flushSt.err, setErr = (v: string) => { flushSt.err = v; ping(); };
   const reg = FL?.registration, recent = [...(FL?.recent || [])].reverse(), last = recent[0];
+  // 응답만 잃었어도 스냅샷에 기록이 보이면 서버가 받은 것이다. 이 번호를 다시 보내면 새 알림이 나가지 않으므로 지운다
+  if (flushSt.fid && !flushSt.busy && recent.some(f => f.flushId === flushSt.fid)) Object.assign(flushSt, { fid: null, err: '' });
+  const err = flushSt.err, setErr = (v: string) => { flushSt.err = v; ping(); };
   const wait = last ? Math.ceil((FL!.cooldownSec || 60) - (Date.now() - new Date(last.createdAt).getTime()) / 1000) : 0;
   // 재요청 대기가 끝나면 버튼을 다시 켠다
   useEffect(() => { if (wait > 0) { const t = setTimeout(() => rerender(n => n + 1), wait * 1000); return () => clearTimeout(t); } }, [wait, last?.createdAt]);
