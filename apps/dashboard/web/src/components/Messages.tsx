@@ -181,6 +181,8 @@ function FlushCard() {
   const [, rerender] = useState(0), hid = useId(); useShared();
   const err = flushSt.err, setErr = (v: string) => { flushSt.err = v; ping(); };
   const reg = FL?.registration, recent = [...(FL?.recent || [])].reverse(), last = recent[0];
+  // 응답만 잃었어도 스냅샷에 기록이 보이면 서버가 받은 것이다. 이 번호를 다시 보내면 새 알림이 나가지 않으므로 지운다
+  if (flushSt.fid && !flushSt.busy && recent.some(f => f.flushId === flushSt.fid)) Object.assign(flushSt, { fid: null, err: '' });
   const wait = last ? Math.ceil((FL!.cooldownSec || 60) - (Date.now() - new Date(last.createdAt).getTime()) / 1000) : 0;
   // 재요청 대기가 끝나면 버튼을 다시 켠다
   useEffect(() => { if (wait > 0) { const t = setTimeout(() => rerender(n => n + 1), wait * 1000); return () => clearTimeout(t); } }, [wait, last?.createdAt]);

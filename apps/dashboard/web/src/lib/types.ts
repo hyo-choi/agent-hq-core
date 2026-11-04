@@ -36,7 +36,7 @@ export interface Msg {
   messageId: string; kind: string; itemId: string | null; label: string | null; text: string; status: string;
   createdAt?: string; processedAt?: string; processNote?: string; link?: MsgLink | null; replies?: { at?: string; text: string }[];
 }
-export interface FlushRec { status: string; createdAt: string; threadName?: string; error?: string }
+export interface FlushRec { flushId?: string; status: string; createdAt: string; threadName?: string; error?: string }
 export interface Flush { registration?: { threadName: string; registeredAt?: string } | null; recent?: FlushRec[]; cooldownSec?: number }
 export interface PrRefresh { running?: boolean; ok?: boolean | null; error?: string | null; finishedAt?: string | null }
 export interface Snap { data: Data; refs: Record<string, string>; requests: Req[]; messages: Msg[]; flush: Flush | null; prRefresh: PrRefresh }

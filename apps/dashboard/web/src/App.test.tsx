@@ -491,4 +491,25 @@ describe('App', () => {
     expect(inboxFlush.disabled).toBe(true);
     expect(document.querySelectorAll('h3[id]').length).toBe(new Set([...document.querySelectorAll('h3[id]')].map(h => h.id)).size);  // 두 곳에 있어도 id 중복 없음
   });
+
+  it('확인 요청 응답만 잃으면 같은 번호로 재시도하고, 서버 기록이 보이면 다음 요청은 새 번호를 쓴다', async () => {
+    const old = new Date(Date.now() - 120_000).toISOString();
+    snap.flush = { registration: { threadName: 'coord', registeredAt: old }, recent: [], cooldownSec: 60 };
+    render(<App />);
+    await screen.findAllByText('Agent HQ');
+    await act(async () => { fireEvent.click(tabBtn('요청함')); });
+    const btn = (label: string) => waitFor(() => { const b = [...document.querySelectorAll('#list button')].find(b => b.textContent === label) as HTMLButtonElement; expect(b?.disabled).toBe(false); return b; });
+    postFail = 2;
+    { const b = await btn('지금 확인 요청'); await act(async () => { fireEvent.click(b); }); }
+    { const b = await btn('다시 시도'); await act(async () => { fireEvent.click(b); }); }
+    await waitFor(() => expect(posts.length).toBe(2));
+    expect(posts[1][1].flushId).toBe(posts[0][1].flushId);
+    // 서버는 받았고 그 뒤 처리까지 끝났다. 옛 번호를 다시 보내면 새 알림이 나가지 않는다
+    snap.flush = { ...snap.flush, recent: [{ flushId: posts[0][1].flushId, status: 'processed', createdAt: old, threadName: 'coord' }] };
+    await refresh();
+    { const b = await btn('지금 확인 요청'); await act(async () => { fireEvent.click(b); }); }
+    await waitFor(() => expect(posts.length).toBe(3));
+    expect(posts[2][1].flushId).not.toBe(posts[0][1].flushId);
+    expect(document.querySelector('#list [role=alert]')).toBeNull();
+  });
 });
