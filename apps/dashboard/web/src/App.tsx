@@ -17,10 +17,10 @@ import { JiraTab, Recs, Search, jiraStatuses } from './components/Views';
 import { Badge } from './components/ui';
 
 const FILTERS = ['q', 'fstatus', 'fcat', 'jq', 'jst', 'gq'];
-// 항목 상세(Det·메시지 원문) 펼침 키. 묶음(Fold·Jira Sprint)과 알림 '더 보기'는 목록 구조라 '상세 모두 닫기'에서 그대로 둔다
+// 항목 상세(Det·메시지 원문) 펼침 키. 묶음(Fold·Jira Sprint)과 알림 '더 보기'는 목록 구조이고, Jira의 Sprint 묶음 기준 안내(jsprint)는 항목 상세가 아니라서 '상세 모두 닫기'에서 그대로 둔다
 const DETAIL = /^(d|m|mx|r):/;
 // '상세 모두 닫기' 단축키 Shift+X. 한글 자판에서는 같은 키가 'ㅌ'로 온다. 입력칸·IME 조합·반복·다른 modifier에서는 동작하지 않는다
-export const isCloseKey = (e: KeyboardEvent) => {
+const isCloseKey = (e: KeyboardEvent) => {
   const t = e.target as HTMLElement | null;
   return e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat && !e.isComposing && e.keyCode !== 229 && !e.defaultPrevented
     && (e.key === 'X' || e.key === 'x' || e.key === 'ㅌ') && !(t?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"])'));
@@ -189,7 +189,7 @@ function Body({ nav, loadErr, loadedAt, anyDetail, closeDetails }: { nav: { curr
             <h1 class="text-2xl font-bold tracking-tight sm:text-3xl">{viewName(tab)}</h1>
             <p class="mt-1 text-sm text-base-content/60">{`스냅샷 ${fmt(d.updatedAt)} · PR 조회 ${fmt(d.prsCheckedAt)}${PRR.running ? ' (조회 중)' : ''} · 실시간 연동 아님`}</p>
           </div>
-            {/* 펼친 검증·남은 일·PR·답변·후속 질문·메시지 상세를 모든 탭에서 한 번에 접는다. 입력 초안·선택은 건드리지 않는다 */}
+            {/* 모든 탭에서 펼친 항목 상세(검증·남은 일·PR·답변·후속 질문·메시지)를 한 번에 접는다. 안내 상세, 입력 초안, 선택은 건드리지 않는다 */}
             <span class="flex items-center gap-1"><button class="btn btn-sm btn-ghost" type="button" disabled={!anyDetail} onClick={closeDetails}
               title="단축키 Shift+X (입력 중에는 동작하지 않음)" aria-keyshortcuts="Shift+X">상세 모두 닫기</button>
               <kbd class="kbd kbd-sm" aria-hidden="true" title="단축키 Shift+X">⇧X</kbd></span></div>
