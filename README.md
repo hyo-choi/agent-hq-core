@@ -261,7 +261,9 @@ PY
 python3 server.py restore --backup "$HQ_DASH_ROOT/backups/<이름>" --out <비어 있는 새 디렉터리>
 ```
 
-- 백업의 무결성을 확인한 뒤 현재 파일과 병합한 결과를 출력 디렉터리의 `public/data.json`, `private/*.json`, `restore-report.json`에 만든다. 충돌이 있거나 파일이 손상됐으면 중단한다.
+- 백업의 무결성을 확인한 뒤 현재 파일과 병합한 결과를 출력 디렉터리의 `public/data.json`, `private/*.json`, `restore-report.json`에 만든다.
+- 백업 파일의 크기나 해시가 manifest와 다르거나 병합 충돌이 있으면 중단한다.
+- 현재 파일이 없거나 손상됐으면 중단하지 않고 백업 값으로 결과를 만든다. 백업 이후의 변경은 복구되지 않을 수 있으며, 그 내용을 `restore-report.json`의 `currentProblems`와 `notes`에 남긴다. 정상 종료만 보지 말고 보고서를 확인한다.
 - 실제 반영은 이 명령이 하지 않는다. 보고서를 확인한 뒤 서버를 멈추고 별도로 진행한다.
 
 ## 보안 모델
