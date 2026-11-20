@@ -692,7 +692,9 @@ s.Handler.log_message = log
     def test_defaults_isolated_and_opt_in(self):
         # 기본값: init 전에는 루트를 만들지 않고, 외부 연동(PR·Jira·Codex)은 설정 없이는 실행하지 않는다
         tmp = tempfile.mkdtemp(prefix="hqdash-init-")
-        env = {k: v for k, v in self.env.items() if k not in ("HQ_GITHUB_REPO", "HQ_JIRA_PROJECT", "HQ_ENABLE_CODEX_FLUSH", "HQ_TASKS_DIR")}
+        env = {k: v for k, v in self.env.items() if k not in ("HQ_GITHUB_REPO", "HQ_JIRA_PROJECT", "HQ_ENABLE_CODEX_FLUSH", "HQ_ENABLE_CLAUDE_FLUSH", "HQ_TASKS_DIR")}
+        env["HOME"] = os.path.join(tmp, "home")
+        os.makedirs(env["HOME"])
         env["HQ_DASH_ROOT"] = root = os.path.join(tmp, "r")
         run = lambda *a, script="server.py": subprocess.run([sys.executable, os.path.join(HERE, script), *a], env=env, capture_output=True, text=True)
         try:
@@ -710,6 +712,26 @@ s.Handler.log_message = log
             self.assertEqual(run("init", "--demo").returncode, 0)
             self.assertTrue(rd(os.path.join(demo, "public", "data.json"))["work"])
             self.assertEqual(run("check").returncode, 0)
+            # 빈 상태와 demo 모두 기본 서버의 실제 HTTP 경로에서 외부 실행이 0건이다.
+            for runtime in (root, demo):
+                env["HQ_DASH_ROOT"] = runtime
+                port = free_port()
+                with subprocess.Popen([sys.executable, os.path.join(HERE, "server.py"), "serve", "--port", str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as proc:
+                    try:
+                        for _ in range(50):
+                            try:
+                                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/dashboard", timeout=1) as response:
+                                    view = json.loads(response.read())
+                                break
+                            except OSError: time.sleep(0.05)
+                        else: self.fail("fresh 서버가 시작되지 않았습니다")
+                        self.assertIsNone(view["flush"]["registration"])
+                        self.assertFalse(view["prRefresh"]["running"])
+                        for calls in ("gh-calls", "codex-calls"):
+                            self.assertFalse(os.path.exists(os.path.join(runtime, calls)))
+                    finally:
+                        proc.terminate(); proc.wait(5)
+
         finally:
             shutil.rmtree(tmp)
 
