@@ -323,7 +323,7 @@ function FlushCard() {
     <Muted cls="text-xs">{reg ? `대상: ${reg.provider === 'claude' ? 'Claude' : 'Codex'} 세션 "${reg.threadName}" · 등록 ${fmt(reg.registeredAt)}` : '미전달: 등록된 담당 에이전트 세션이 없어 보낼 수 없습니다. 에이전트가 세션을 등록하면 쓸 수 있습니다.'}</Muted>
     {reg ? <div class="flex flex-wrap items-center gap-1.5 text-xs text-base-content/60">
       {open ? <><Badge cls={FLUSH_ST[open.status][1]}>{'진행 중 · ' + FLUSH_ST[open.status][0]}</Badge>{`요청 ${fmt(open.createdAt)}`}</> : <Badge>진행 중인 요청 없음</Badge>}</div> : null}
-    {open && open.status === 'queued' ? <Muted cls="text-xs">세션에 알림을 넣었습니다. 쉬고 있으면 바로, 작업 중이면 지금 작업이 끝난 뒤 확인합니다. 에이전트가 처리를 기록하면 진행 중 표시가 사라집니다.</Muted> : null}
+    {open && open.status === 'queued' ? <Muted cls="text-xs">세션으로 알림을 보냈습니다. 실제 수신·확인 시점은 보장하지 않습니다. 처리 여부는 에이전트가 남긴 완료 기록으로 확인해 주세요.</Muted> : null}
     {failed ? <ErrAlert>{`전달하지 못했습니다: ${failed.error || '사유 미상'}`}</ErrAlert> : null}
     {flushSt.fid && !flushSt.busy ? <ErrAlert>직전 요청의 결과를 받지 못했습니다. 다시 시도하면 같은 요청 번호라 중복 전송되지 않습니다.</ErrAlert> : null}
     <div class="mt-1 flex flex-wrap items-center gap-2">

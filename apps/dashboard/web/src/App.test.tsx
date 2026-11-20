@@ -32,6 +32,17 @@ const refresh = () => act(async () => { document.dispatchEvent(new Event('visibi
 const tabBtn = (name: string) => screen.getAllByRole('tab').find(b => b.textContent!.startsWith(name))!;
 
 describe('App', () => {
+  for (const provider of ['codex', 'claude']) it(`${provider} 알림은 실제 수신·확인 시점을 보장하지 않는다`, async () => {
+    const now = new Date().toISOString();
+    snap.flush = { registration: { provider, threadName: '합성 세션', registeredAt: now },
+      recent: [{ flushId: 'pending', status: 'queued', threadName: '합성 세션', createdAt: now, active: true }], cooldownSec: 60 };
+    sessionStorage.setItem('tab', '"inbox"');
+    render(<App />);
+    expect(await screen.findByText(/실제 수신·확인 시점은 보장하지 않습니다/)).toBeTruthy();
+    expect(screen.queryByText(/쉬고 있으면 바로|작업이 끝난 뒤 확인합니다/)).toBeNull();
+    expect(screen.getByText(/완료 기록으로 확인해 주세요/)).toBeTruthy();
+  });
+
   it('이미지 안내는 hover와 고정 열기, Escape 및 바깥 누르기로 닫힌다', async () => {
     sessionStorage.setItem('tab', '"inbox"');
     render(<App />);
