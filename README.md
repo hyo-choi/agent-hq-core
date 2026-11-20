@@ -40,6 +40,7 @@ cd apps/dashboard && python3 server.py init
 | `HQ_DASH_ROOT` | `~/.local/share/agent-hq-core` | 실행 데이터 루트(`public/data.json`, `private/`, `backups/`) |
 | `HQ_GITHUB_REPO` | 없음 | `owner/name`. 지정하면 `data.prs`의 PR을 `gh pr view`로 읽기 전용 조회(화면 요청 시 5분 간격, 또는 `python3 refresh_prs.py`)하고 PR 링크를 만든다. 저장된 GitHub PR url이 있으면 그 레포로 조회하고, 이 값은 url이 없거나 GitHub가 아닌 url의 PR에 쓴다. `gh` 로그인이 필요하다 |
 | `HQ_JIRA_PROJECT` | 없음 | Jira 프로젝트 키. 지정하면 `import-jira FILE`로 미리 받아 둔 조회 스냅샷 파일을 가져온다(서버가 Jira를 호출하지는 않는다). 형식은 [Jira 스냅샷](#jira-스냅샷)을 본다 |
+| `HQ_ENABLE_CLAUDE_FLUSH` | 없음 | 정확히 `1`일 때만 등록한 Claude 세션의 inbox socket으로 고정 알림을 보낸다. Codex 설정과 독립적이다 |
 | `HQ_ENABLE_CODEX_FLUSH` | 없음 | `1`이면 '지금 확인 요청' 버튼이 등록된 Codex thread에 고정 문구를 `codex queue`로 적재한다(`flush register` 필요) |
 | `HQ_TASKS_DIR` | 없음 | 지정하면 `check`가 그 디렉터리의 task 문서 첫머리 `항목: HQ-n`을 데이터와 대조한다 |
 | `CODEX_HOME`, `HQ_CODEX_BIN` | `~/.codex`, `codex` | Codex 알림을 켰을 때만 쓴다 |
@@ -128,17 +129,26 @@ hq reject --request <requestId> --reason "사용자가 요청을 철회함"
 
 숨김(`process-inbox`·`reject`)은 화면 표시 여부만 정하며 업무 진행 상태와 별개다. 답변(`msg respond`)은 화면의 해당 메시지에 표시된다. 처리 기록(`msg process`)은 업무 완료·결정 승인과 별개이므로 필요한 `item set`/`item resolve`를 따로 실행한다.
 
-### 5. (선택) Codex 즉시 알림
+### 5. (선택) 즉시 알림과 자기 등록
 
-화면의 '지금 확인 요청' 버튼은 기본으로 기록만 남긴다. 먼저 `codex queue --help`로 쓰는 Codex CLI가 `queue` 명령을 지원하는지 확인한다. 지원할 때만 켤 수 있으며, 지원하지 않는 버전이나 다른 CLI는 아래 알림 없이 에이전트가 직접 `msg list`·`list`를 확인하는 기본 경로를 쓴다. 지원한다면 `HQ_ENABLE_CODEX_FLUSH=1`을 서버와 에이전트 셸 모두에 준다. 그러면 버튼을 누를 때 등록한 Codex thread 하나에 고정 문구를 `codex queue`로 적재한다. thread는 `CODEX_HOME/session_index.jsonl`에 있는 실제 session UUID여야 한다.
+기본값은 외부 전달 없음이다. Codex는 `HQ_ENABLE_CODEX_FLUSH=1`, Claude는 별도로 `HQ_ENABLE_CLAUDE_FLUSH=1`을 서버와 에이전트 셸에 준다. 어느 설정도 다른 provider를 켜지 않는다. 등록을 저장한 뒤 서버를 설정 없이 재시작해도 외부로 전달하지 않는다. 한 번에 coordinator 한 세션만 등록하며 새 등록은 이전 등록을 교체한다.
+
+Codex는 먼저 `codex queue --help`로 CLI의 지원 여부를 확인한다. `--self`는 `CODEX_THREAD_ID`를 읽고 `CODEX_HOME/session_index.jsonl`에서 그 UUID를 확인한다. 환경변수가 없거나 지원하지 않는 CLI에서는 명시 등록이나 수동 요청함 확인을 쓴다. `CODEX_SESSION_ID`만 있는 환경은 자기 등록으로 판정하지 않는다.
 
 ```sh
-hq flush register --provider codex --thread <Codex session UUID> --evidence "이 대화에서 확인한 근거"
-hq flush status                 # 요청 기록과 적재 결과
-hq flush done --id <flushId> --note "요청함 처리 완료"
+hq flush register --self
+# Codex 자기 등록을 쓸 수 없을 때:
+hq flush register --provider codex --thread <자기 session UUID> --evidence "현재 대화에서 확인한 근거"
+hq flush status
+hq flush done --id <flushId> --note "요청함 처리 결과"
+hq flush unregister
 ```
 
-적재는 해당 대화의 입력 큐에 들어갔다는 뜻일 뿐이며, 처리 여부는 에이전트가 `flush done`으로 남긴 기록으로 판단한다. 다른 CLI에는 알림을 보내지 않으므로, 그때는 에이전트가 작업 경계마다 직접 `msg list`·`list`를 확인한다.
+Claude는 실행 중인 자기 세션에서 `--self`로만 등록한다. `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`이 모두 필요하며 현재 사용자가 소유한 Unix socket을 확인한다. Claude와 Codex 환경변수가 함께 있으면 추측하지 않고 실패하므로 `--self --provider claude` 또는 `--self --provider codex`를 명시한다.
+
+Claude 전달은 내부 inbox 형식에 기대는 과도기 구현이며 수신 확인(ack)이 없다. `queued`는 socket에 썼다는 뜻으로 읽음·처리 성공을 보장하지 않는다. 공식 전달 CLI/API가 생기면 이 경로를 교체한다. 버전 변경·세션 재개 뒤에는 재등록과 확인이 필요하며 PID 재사용으로 다른 세션에 전달될 가능성도 남는다. 토큰은 CLI/HTTP 응답에는 숨기지만 `private/flush.json`과 JSON 백업에는 남으므로 함께 보호한다. Codex도 적재와 처리는 구분하며 처리 완료는 coordinator의 `flush done` 기록으로 판단한다.
+
+서버는 같은 등록 이후의 `queued`/`sending`만 열린 요청으로 본다. 공개 `flush.recent[].active`와 화면 버튼도 이 판정을 공유하므로 같은 이름으로 재등록해도 이전 요청이 새 버튼을 막지 않는다. 60초 재요청 대기는 이전 요청을 포함해 유지한다.
 
 ## 주요 명령
 
@@ -155,6 +165,42 @@ python3 server.py --help                    # 전체 명령
 
 - 항목 상태는 `state`(`open`·`blocked`·`waiting_user`·`done`·`closed`·`dropped`)로 기록한다. 모든 쓰기는 하나의 파일 락 아래 원자적으로 하며, 그날 첫 쓰기 전에 `backups/`에 스냅샷을 만든다.
 - 화면의 메시지·숨김 요청·확인 요청은 서버가 보관만 한다. 승인·처리는 coordinator가 CLI로 한다. 웹에서 셸 명령을 실행하는 경로는 없다.
+
+## 파생 관계와 긴 본문
+
+`derivedFrom`은 파생 항목 하나에 원본의 내부 id를 저장한다. `item add`와 `item set`에서 HQ 번호 또는 내부 id를 받으며, `item get`은 역방향 `derivedItems`를 계산한다. 메시지의 분류에는 기존 `msg link`를 쓴다.
+
+```sh
+hq item add question --set q="후속 검토" --set status="조사 중" --set derivedFrom=HQ-1
+hq item get HQ-1
+hq item set <파생항목> --set derivedFrom=       # 연결 해제
+```
+
+자기 연결·순환·없는 대상·PR을 원본으로 지정하는 것은 거절한다. 숨긴 원본은 유지하고 화면에서는 이동할 수 없는 이유를 안내한다. 관계는 이동용이며 승인·업무 상태를 전파하지 않는다. `check`는 없어진 원본을 경고한다.
+
+긴 설명은 Markdown `###` 단위로 접는다. `해 주실`, `확인해 주실`, `정해 주실`, `필요한 결정`, `추천`, `선택지`, `막힌 이유`, `주의하실`, `꼭 확인`, `머지 전에`, `위험`, `알아 두실`, `필요한 선택`, `우선 결정`, `다음 행동`이 제목에 있거나 하위 제목에 있으면 기본으로 펼친다. 그 밖의 섹션과 검증 전체는 기본 접힘이다. 한국어 화면의 안내 정책이며 `확인 N` 배지는 이런 섹션 수를 세므로 미처리 업무 수와 다르다. 소제목 앞 글은 항상 보이고 검색 중에는 관련 본문이 펼쳐진다. 사용자 선택은 세션 동안 유지하고 '상세 모두 닫기'로 본문도 닫는다. 같은 제목 앞에 같은 제목을 삽입하면 저장된 접힘 상태가 밀릴 수 있다.
+
+## 메시지 이미지와 캡처
+
+메시지 입력에서 파일 선택·붙여 넣기·끌어다 놓기로 PNG/JPEG/WebP를 장당 5MiB, 최대 6장 첨부한다. 이미지 옆 `(?)`는 hover·focus로 열고 클릭으로 고정하며 Escape·바깥 누르기로 닫는다. 이미지 초안은 새로고침하면 사라지고 텍스트 초안만 유지된다. 전송 실패 뒤 편집 없이 재시도하면 같은 메시지·업로드 키를 쓰며, 편집하면 보존한 File을 새 키로 다시 올린다. 응답을 잃은 뒤 편집하면 원래 접수된 메시지와 새 메시지가 둘 다 남을 수 있다. 처리된 메시지 묶음은 계속 조회할 수 있다.
+
+업로드와 메타데이터는 `HQ_DASH_ROOT/private/uploads/`에 저장한다. 전체 한도는 256MiB이며 메시지에 연결한 이미지는 생성 후 14일, 미연결 이미지는 1일 뒤 정리한다. 서버 시작·업로드 때 정리하므로 만료 즉시 파일을 지우는 예약 작업은 없다. 만료 뒤에도 메시지 원문·첨부 id·형식·크기는 남고 '보관 기간이 지나 삭제됨'으로 표시한다. 이미지 파일과 업로드 메타데이터 자체는 JSON 백업/복원 대상이 아니다. `msg read`는 유효한 첨부의 로컬 절대 경로를 보여 준다. 형식은 magic bytes만 검사하며 완전한 디코딩·재인코딩은 하지 않는다.
+
+`HQ_DASH_ROOT/captures/<폴더>/`에 신뢰하는 로컬 작성자가 만든 캡처를 놓으면 `/captures/<폴더>/`의 `index.html` 또는 그 안의 단일 파일을 읽기 전용으로 제공한다. 허용 확장자는 html/png/jpg/jpeg/webp/gif/json이고 폴더·파일 이름은 ASCII 영숫자·하이픈·밑줄로 시작하는 128자 이하 이름이다. HTML은 `sandbox allow-scripts`로 제공해 opaque Origin이 되며 진행판 POST가 거절된다. symlink 경로 탈출은 거절하지만 하드 링크로 놓은 파일은 읽을 수 있다. 신뢰하지 않는 로컬 작성자를 격리하는 기능은 아니며 계정·토큰·서명 URL·개인 자료가 보이는 캡처를 두지 않는다. 파일 전체를 메모리로 읽고 동시 캡처 GET 수에는 별도 제한이 없다.
+
+이미지 업로드는 동시에 4건, 요청/응답은 유휴 20초·전체 120초 제한이다. 정상 진전은 유휴 시간을 갱신하지만 전체 마감은 연장하지 않는다. 느린 이미지 전송은 전역 데이터 lock 밖에서 수행한다. 슬롯에는 사용자별 공정성이 없으며 인증·rate limit을 제공하지 않는다.
+
+## 브라우저 확장
+
+GitHub owner 하나와 선택적 Jira 사이트를 설정하는 unpacked 확장이다. 기본 소스는 URL/owner가 비어 있고 어떤 기본 서버로도 요청하지 않는다. 설치자별 설정과 manifest를 함께 생성한다. [설치·권한·한계](apps/github-extension/README.md)를 따른다.
+
+```sh
+node apps/github-extension/configure.mjs --api http://127.0.0.1:48173 --owner example-org
+# 생성한 apps/github-extension/local/extension을 Load unpacked로 설치한 뒤 자기 ID 확인
+python3 apps/dashboard/server.py serve --ext-origin chrome-extension://<자기확장ID>
+```
+
+생성 폴더는 Git에서 제외하며 key를 넣지 않는다. 서버의 확장 허용 목록은 기본 비어 있고 exact origin만 메시지·업로드·flush POST에 허용한다. 숨김 요청은 계속 거절한다. 경로가 바뀌어 ID가 달라지면 이전 origin을 제거하고 새 ID를 등록한다. 알림은 별도의 provider opt-in과 coordinator 등록이 필요하다.
 
 ## 명령이 없는 데이터 쓰기
 
@@ -268,8 +314,8 @@ python3 server.py restore --backup "$HQ_DASH_ROOT/backups/<이름>" --out <비�
 
 ## 보안 모델
 
-- 정적 경로는 `/`·`/index.html`만 정확히 허용한다. 데이터 파일은 `GET /api/dashboard` 응답으로만 나간다.
-- POST는 같은 origin(`Origin` 고정 허용 목록, `Sec-Fetch-Site`), `application/json`, 16KB 이하 본문만 받는다. 응답에는 엄격한 CSP를 붙인다.
+- 기본 정적 화면은 `/`·`/index.html`만 허용하고 별도 검증한 첨부·캡처 GET을 제공한다. 데이터 파일은 `GET /api/dashboard` 응답으로만 나간다.
+- JSON POST는 고정 Origin 허용 목록과 `Sec-Fetch-Site`, `application/json`, 16KiB 본문 제한을 검사한다. 등록 확장은 메시지·업로드·flush만 예외로 허용한다. raw 이미지 업로드는 5MiB까지다. 중복 Origin·Content-Length 및 Transfer-Encoding을 거절하며 응답에 CSP를 붙인다. Origin은 브라우저 CSRF 경계로, 비브라우저 클라이언트 인증 수단은 아니다.
 - 인증 기능은 없다. 신뢰하는 장치에서 loopback이나 사설 tailnet에만 띄운다.
 
 ## 테스트
@@ -277,7 +323,8 @@ python3 server.py restore --backup "$HQ_DASH_ROOT/backups/<이름>" --out <비�
 ```sh
 cd apps/dashboard
 pnpm build && pnpm test          # 화면 빌드·vitest
-python3 test_server.py           # 서버·CLI (먼저 pnpm build 필요). 임시 HQ_DASH_ROOT와 가짜 gh·codex만 쓴다
+python3 test_server.py           # 서버·CLI (먼저 pnpm build 필요). 임시 ROOT/HOME, 가짜 gh·codex·socket만 사용
+node --test ../github-extension/*.test.mjs
 ```
 
 ## 운영 지침 템플릿 (선택)
