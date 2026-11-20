@@ -77,12 +77,12 @@ test("merged PR은 mergedPrs에서 찾아 메시지는 가능, 리베이스는 �
   assert.equal(L.prSummary(null), "진행판에 등록되지 않음");
 });
 
-test("리베이스 문구는 운영 정책을 담고, 미처리 요청이 있으면 막으며 처리 후 다시 열린다", () => {
+test("리베이스 문구는 현재 권한 범위를 따르고, 미처리 요청이 있으면 막으며 처리 후 다시 열린다", () => {
   const text = L.rebaseText(pr);
   assert.match(text, /^\[리베이스 요청\] example-org\/demo-repo#41\nhttps:\/\/github\.com\/example-org\/demo-repo\/pull\/41\n/);
-  assert.match(text, /충돌은 해결/);
-  assert.match(text, /expected SHA/);
-  assert.match(text, /--force-with-lease/);
+  assert.match(text, /충돌의 의도가 불분명/);
+  assert.match(text, /검증 결과/);
+  assert.match(text, /현재 작업의 권한 범위/);
   assert.ok(L.isRebaseText(`${text}\n\n추가 메모`, pr));
   assert.ok(!L.isRebaseText("리베이스 언제 되나요?", pr));
   const received = dash({ messages: [{ messageId: "a".repeat(32), status: "received", text }], refs: { [`msg-${"a".repeat(32)}`]: "HQ-3" } });

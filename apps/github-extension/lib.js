@@ -201,7 +201,7 @@ export function rebaseText(pr) {
   return [
     `${REBASE_PREFIX} ${pr.owner}/${pr.repo}#${pr.number}`,
     pr.url,
-    "최신 base 브랜치로 리베이스해 주세요. 의도가 명확한 충돌은 해결하고, 판단이 필요한 충돌은 보고해 주세요. 검증 후 expected SHA를 지정한 --force-with-lease로 push해도 됩니다.",
+    "base 브랜치와의 차이를 확인하고 리베이스해 주세요. 충돌의 의도가 불분명하면 필요한 결정을 보고하고 검증 결과를 알려 주세요. 원격 반영은 현재 작업의 권한 범위에 따릅니다.",
   ].join("\n");
 }
 

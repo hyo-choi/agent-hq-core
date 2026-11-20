@@ -26,7 +26,7 @@ export function configure(options, out = path.join(HERE, 'local', 'extension')) 
   fs.mkdirSync(out, { recursive: true });
   for (const name of ['manifest.json', 'popup.html', 'popup.js', 'lib.js', 'sw.js', 'list-button.js', 'pr-links.js', 'comment-button.js', 'images.js', 'help.js']) {
     const source = path.join(HERE, name);
-    if (fs.existsSync(source)) fs.copyFileSync(source, path.join(out, name));
+    fs.copyFileSync(source, path.join(out, name));
   }
   fs.writeFileSync(path.join(out, 'config.js'), `export const CONFIG = Object.freeze(${JSON.stringify(config)});\n`);
   fs.writeFileSync(path.join(out, 'owner.js'), `globalThis.AGENT_HQ_OWNER = ${JSON.stringify(config.owner)};\n`);
