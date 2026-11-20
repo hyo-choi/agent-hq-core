@@ -1,5 +1,6 @@
 // 항목 메시지(결정 답변·후속 질문)·자유 메시지·요청함. 서버는 보관·표시만 한다. 보내도 결정 승인·작업 완료로 바뀌지 않으며,
 // coordinator가 읽고 처리한 뒤 답변을 남긴다. 사용자 글과 답변 본문은 Md(raw HTML 이스케이프, http·https 절대 링크만)로 그린다
+import type { ComponentChildren } from 'preact';
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useApp } from '../ctx';
 import { markSeen, newBox } from '../lib/alerts';
@@ -23,6 +24,72 @@ const images: Record<string, PendingImage[]> = {};
 const imageMids: Record<string, string | null> = {};
 const IMAGE_MAX = 5 * 1024 * 1024, IMAGE_COUNT = 6;
 const sendSt: Record<string, { busy: boolean; err: string; failed: boolean }> = {};
+
+// 눌러 고정한 안내와 hover 안내도 같은 소유권을 써서 동시에 겹쳐 열리지 않게 한다.
+let activeHelp: { close: () => void } | null = null;
+
+// native popover의 상위 레이어로 패널 스크롤에 잘리지 않게 하고, hover 때 패널 높이와 버튼 위치를 유지한다.
+function ButtonHelp({ action, icon, label, children }: { action: ComponentChildren; icon: string; label: string; children: ComponentChildren | ((restoreFocus: () => void) => ComponentChildren) }) {
+  const id = useId(), root = useRef<HTMLDivElement>(null), hint = useRef<HTMLDivElement>(null), button = useRef<HTMLButtonElement>(null), pinned = useRef(false);
+  const [open, setOpen] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null), suppressFocus = useRef(false), owner = useRef({ close: () => {} });
+  const cancelClose = () => { if (timer.current !== null) { clearTimeout(timer.current); timer.current = null; } };
+  const close = () => {
+    cancelClose(); pinned.current = false; setOpen(false);
+    if (activeHelp === owner.current) activeHelp = null;
+  };
+  owner.current.close = close;
+  const show = () => {
+    cancelClose();
+    if (activeHelp !== owner.current) activeHelp?.close();
+    activeHelp = owner.current; setOpen(true);
+  };
+  const restoreFocus = () => {
+    if (!button.current?.isConnected) return;
+    // 닫힌 안내로 복귀하는 focus 이벤트는 새 열기 요청이 아니다.
+    suppressFocus.current = true; button.current.focus(); suppressFocus.current = false;
+  };
+  // 아이콘과 상위 레이어 안내 사이의 빈 공간을 지나갈 시간을 주고 재진입하면 취소한다.
+  const leave = () => {
+    cancelClose();
+    if (!pinned.current && !root.current?.contains(document.activeElement)) timer.current = setTimeout(close, 180);
+  };
+  useEffect(() => () => { cancelClose(); if (activeHelp === owner.current) activeHelp = null; }, []);
+  useLayoutEffect(() => {
+    const el = hint.current!;
+    if (!open) { el.hidePopover?.(); return; }
+    el.showPopover?.();
+    const place = () => {
+      const rect = button.current!.getBoundingClientRect(), margin = 12, width = Math.min(320, innerWidth - margin * 2);
+      el.style.width = `${width}px`; el.style.maxHeight = `${innerHeight - margin * 2}px`;
+      el.style.left = `${Math.max(margin, Math.min(rect.left, innerWidth - width - margin))}px`;
+      const height = el.getBoundingClientRect().height;
+      el.style.top = `${Math.max(margin, rect.bottom + height <= innerHeight - margin ? rect.bottom : rect.top - height)}px`;
+    };
+    place(); addEventListener('resize', place); addEventListener('scroll', place, true);
+    return () => { removeEventListener('resize', place); removeEventListener('scroll', place, true); };
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    const outside = (e: PointerEvent) => { if (!root.current?.contains(e.target as Node)) close(); };
+    const escape = (e: KeyboardEvent) => { if (e.key === 'Escape' && !e.isComposing) {
+      e.stopPropagation(); const inside = hint.current?.contains(document.activeElement); close(); if (inside) restoreFocus();
+    } };
+    document.addEventListener('pointerdown', outside);
+    document.addEventListener('keydown', escape, true);
+    return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', escape, true); };
+  }, [open]);
+  return <div ref={root} class="flex min-w-0 flex-wrap items-center gap-x-1"
+    onMouseEnter={cancelClose} onMouseLeave={leave}
+    onFocusOut={e => { if (!root.current?.contains(e.relatedTarget as Node)) close(); }}>
+    {action}
+    <button ref={button} type="button" onMouseEnter={show} onFocus={() => { if (!suppressFocus.current) show(); }} class="btn btn-ghost btn-sm btn-circle" aria-label={label} aria-expanded={open} aria-controls={id}
+      onClick={() => { if (pinned.current) close(); else { pinned.current = true; show(); } }}><span aria-hidden="true" class="flex size-4 items-center justify-center rounded-full border border-current text-xs">{icon}</span></button>
+    <div ref={hint} onMouseEnter={cancelClose} onMouseLeave={leave} id={id} popover="manual" hidden={!open} class="fixed m-0 overflow-y-auto rounded-box border border-base-300 bg-base-200 p-2 text-xs text-base-content shadow-lg">
+      {typeof children === 'function' ? children(restoreFocus) : children}
+    </div>
+  </div>;
+}
 
 // 항목 메시지와 자유 메시지(kind general, itemId 없음)가 같은 입력·전송·초안·재시도 흐름을 쓴다. dkey는 초안 키다.
 // textarea는 비제어 입력이라 60초 갱신·IME 조합 중에도 값과 커서를 건드리지 않는다. 초안은 localStorage에 남는다
@@ -116,8 +183,9 @@ export function Composer({ dkey, kind, itemId, ariaLabel, placeholder, rows = 3 
     </div>)}</div>
     <input ref={picker} type="file" accept="image/png,image/jpeg,image/webp" multiple class="hidden" aria-label={`${ariaLabel} 이미지 파일 선택`}
       disabled={busy} onChange={e => { addImages(Array.from(e.currentTarget.files || [])); e.currentTarget.value = ''; }} />
-    <button class="btn btn-sm mt-2" type="button" disabled={busy} onClick={() => picker.current?.click()}>이미지 첨부</button>
-    <Muted cls="mt-1 text-xs">붙여 넣기·끌어다 놓기·파일 선택 · PNG/JPEG/WebP · 장당 5MiB, 최대 6장. 이미지 초안은 새로고침하면 사라집니다. 전송된 이미지는 14일 뒤 삭제됩니다.</Muted>
+    <div class="mt-2"><ButtonHelp icon="?" label="이미지 첨부 안내" action={<button class="btn btn-sm" type="button" disabled={busy} onClick={() => picker.current?.click()}>이미지 첨부</button>}>
+      붙여 넣기·끌어다 놓기·파일 선택 · PNG/JPEG/WebP · 장당 5MiB, 최대 6장. 이미지 초안은 새로고침하면 사라집니다. 전송된 이미지는 14일 뒤 삭제됩니다.
+    </ButtonHelp></div>
     <div class="mt-2 flex flex-wrap items-center justify-between gap-2">
       <span class="text-xs tabular-nums text-base-content/60">{text.trim().length}/{MSG_MAX}</span>
       <button class="btn btn-sm btn-primary" type="button" disabled={busy || (!text.trim() && !attached.length)} onClick={send}>{busy ? '보내는 중…' : failed ? '다시 보내기' : '보내기'}</button>

@@ -32,6 +32,22 @@ const refresh = () => act(async () => { document.dispatchEvent(new Event('visibi
 const tabBtn = (name: string) => screen.getAllByRole('tab').find(b => b.textContent!.startsWith(name))!;
 
 describe('App', () => {
+  it('이미지 안내는 hover와 고정 열기, Escape 및 바깥 누르기로 닫힌다', async () => {
+    sessionStorage.setItem('tab', '"inbox"');
+    render(<App />);
+    const b = await screen.findByRole('button', { name: '이미지 첨부 안내' });
+    fireEvent.mouseEnter(b);
+    expect(b.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(b);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(b.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(b);
+    expect(b.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.pointerDown(document.body);
+    expect(b.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('button', { name: /최신화 요청|자원 정리 요청/ })).toBeNull();
+  });
+
   it('같은 이름으로 재등록하면 이전 queued 요청이 새 버튼을 막지 않는다', async () => {
     snap.flush = { registration: { provider: 'codex', threadName: '합성 세션', registeredAt: '2030-02-02T00:00:00Z' },
       recent: [{ flushId: 'old', status: 'queued', threadName: '합성 세션', createdAt: '2030-02-01T00:00:00Z', active: false }], cooldownSec: 60 };
@@ -708,7 +724,7 @@ describe('App', () => {
     });
   }
   // 우측 하단 진입점: 요청함과 같은 초안·전송 상태를 쓴다
-  const fab = () => document.querySelector('button.btn-circle[aria-expanded]') as HTMLButtonElement;  // Alerts 접기 버튼도 aria-expanded라 원형 버튼으로 좁힌다
+  const fab = () => document.querySelector('button.btn-circle.btn-lg[aria-expanded]') as HTMLButtonElement;  // Alerts 접기 버튼도 aria-expanded라 원형 버튼으로 좁힌다
   const panelTa = () => document.querySelector('[role=dialog][aria-label="메시지 보내기"] textarea') as HTMLTextAreaElement;
   const inboxTa = () => [...document.querySelectorAll('#list textarea[aria-label="새 자유 메시지"]')][0] as HTMLTextAreaElement;
 
