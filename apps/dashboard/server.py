@@ -1055,9 +1055,9 @@ CATEGORIES = ("PR·코드", "에이전트 운영", "진행 보고·알림", "기
 REQUIRED = {"work": ("title", "status"), "question": ("q", "status"), "decision": ("title",)}
 DONE_FIELD = {"work": "conclusion", "question": "answer"}  # state done이면 비어 있으면 안 된다
 # set으로 바꿀 수 있는 키. add는 여기에 REQUIRED 키를 더한다. id·history·rev·updatedAt·updatedBy는 CLI만 쓴다
-PATCH_KEYS = {"work": ("status", "state", "conclusion", "verification", "remaining", "evidence", "prs"),
-              "question": ("status", "state", "answer", "evidence", "category", "thread", "prs"),
-              "decision": ("detail", "waiting", "evidence", "prs")}
+PATCH_KEYS = {"work": ("status", "state", "conclusion", "verification", "remaining", "evidence", "prs", "derivedFrom"),
+              "question": ("status", "state", "answer", "evidence", "category", "thread", "prs", "derivedFrom"),
+              "decision": ("detail", "waiting", "evidence", "prs", "derivedFrom")}
 FIELD_MAX = 4000
 SOURCE_RE = re.compile(r"^(HQ-[1-9][0-9]{0,6}|chat:\d{4}-\d{2}-\d{2})$")
 
@@ -1109,6 +1109,27 @@ def clean_fields(kind, fields, allowed):
             sys.exit(f"{k}: {e}")
         out[k] = v
     return out
+
+
+def link_origin(data, refs, fields, o=None):
+    """derivedFrom(HQ-n 또는 내부 id)을 실재하는 원본의 내부 id로 바꾼다. 빈 값은 연결 해제다. 자기 연결·순환은 거절한다.
+    이동용 연결일 뿐 부모자식·승인·상태 전파 의미가 없다. 역방향은 저장하지 않고 원본 쪽에서 계산한다."""
+    v, iid = fields.get("derivedFrom"), o and o["id"]
+    if not v:
+        if not (o or {}).get("derivedFrom"):  # 해제할 연결이 없으면 변경이 아니다
+            fields.pop("derivedFrom", None)
+        return
+    cur = resolve_key(v, refs)
+    if not (cur and find_item(data, cur)):
+        sys.exit(f"derivedFrom 대상 {v} 없음 (작업·질문·결정만 연결한다)")
+    fields["derivedFrom"] = cur
+    seen = set()
+    while cur and cur not in seen:
+        if cur == iid:
+            sys.exit(f"derivedFrom {v}: 자기 자신이나 자기에게서 파생된 항목에는 연결할 수 없습니다")
+        seen.add(cur)
+        hit = find_item(data, cur)
+        cur = hit and data[hit[1]][hit[2]].get("derivedFrom")
 
 
 def read_fields(a):
@@ -1179,6 +1200,7 @@ def item_cli(a):
             if a.kind != "decision":
                 fields.setdefault("state", "open")
             check_item(a.kind, fields, a.reason)
+            link_origin(data, refs, fields)
             # 지금 data의 id와, 지워진 항목까지 남아 있는 refs.map의 id 모두와 겹치지 않게 한다(옛 번호·숨김·메시지 연결이 따라붙지 않게)
             taken = {o.get("id") for k in (*[v[0] for v in LISTS.values()], "resolvedDecisions") for o in data.get(k) or [] if isinstance(o, dict)} | set(refs)
             iid = next(i for i in iter(lambda: f"{prefix}-{secrets.token_hex(4)}", None) if i not in taken)
@@ -1197,7 +1219,10 @@ def item_cli(a):
         kind, key, i = hit
         o = data[key][i]
         if a.icmd == "get":
-            return item_out(kind, o, refs, hidden, key == "resolvedDecisions")
+            kids = [x["id"] for k in (*[v[0] for v in LISTS.values()], "resolvedDecisions") for x in data.get(k) or []
+                    if isinstance(x, dict) and x.get("derivedFrom") == iid]
+            return {**item_out(kind, o, refs, hidden, key == "resolvedDecisions"),
+                    "derivedItems": [{"id": x, "ref": refs.get(x), "hidden": x in hidden} for x in kids]}
         if key == "resolvedDecisions":
             sys.exit(f"{a.id}는 이미 해소된 결정입니다(읽기 전용)")
         if a.expect_rev is not None and int(o.get("rev") or 0) != a.expect_rev:
@@ -1206,6 +1231,7 @@ def item_cli(a):
             fields = clean_fields(kind, read_fields(a), PATCH_KEYS[kind])
             if not fields:
                 sys.exit("바꿀 필드가 없습니다(--file 또는 --set)")
+            link_origin(data, refs, fields, o)
             new = {**o, **fields}
             check_item(kind, new, a.reason)
             change = describe(o, new)
@@ -1276,6 +1302,8 @@ def check():
             seen[iid] = key
             if iid not in m:
                 old("ref-missing", iid)  # 다음 화면 조회·migrate-ids 때 부여된다
+            if o.get("derivedFrom") and not find_item(data, o["derivedFrom"]):
+                add(warnings, "relation-target-missing", iid, f"derivedFrom 대상 {o['derivedFrom']}이 data에 없습니다")
             for f in REQUIRED[kind]:
                 if not (isinstance(o.get(f), str) and o[f].strip()):
                     add(errors, "field-missing", iid, f"필수 필드 {f}가 없습니다")
@@ -1301,7 +1329,7 @@ def check():
             if g != "done" and ps and all(p and p.get("ok") is True and p.get("state") in ("MERGED", "CLOSED") for p in ps):
                 add(warnings, "open-but-prs-finished", iid, f"연결 PR {', '.join(pr_text(prs, n) for n in o['prs'])}이 모두 끝났는데 {now_st}는 미완료입니다(merged가 곧 업무 종료는 아님)")
             if g == "decide":
-                blob = json.dumps(o, ensure_ascii=False)
+                blob = json.dumps({k: v for k, v in o.items() if k != "derivedFrom"}, ensure_ascii=False)  # 파생 연결은 해소된 결정 언급이 아니다
                 hit = [d for d in resolved if d in blob or (m.get(d) and re.search(rf"\b{m[d]}\b", blob))]
                 if hit:
                     add(warnings, "waiting-on-resolved-decision", iid, f"이미 해소된 결정 {', '.join(m.get(d) or d for d in hit)}을 언급하는데 {now_st}는 결정 대기입니다")

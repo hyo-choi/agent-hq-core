@@ -1156,6 +1156,62 @@ class T(unittest.TestCase):
         self.assertIn("무결성 실패", self.restore(bdir, out).stderr)
         self.assertIn("완료된 백업", self.restore(os.path.join(self.root, "backups"), out).stderr)
 
+    # ---------- 파생 관계 (derivedFrom) ----------
+    def test_item_derived_from(self):
+        self.get("/api/dashboard")
+        st = os.path.join(self.root, "private", "state.json")
+        ids = self.ids(); a, b = ids["work"]; q, dec = ids["question"], ids["decision"]
+        ref_a = rd(st)["refs"]["map"][a]
+        refs0, status_a = rd(st)["refs"], rd(self.data)["work"][0]["status"]
+        r = self.item("add", "work", file={"title": "파생 작업", "status": "진행 중", "derivedFrom": ref_a})  # HQ 번호는 내부 id로 저장
+        kid = r["id"]
+        self.assertEqual(r["item"]["derivedFrom"], a)
+        r = self.item("set", b, "--set", f"derivedFrom={a}", "--reason", "성격이 달라 별도 티켓")
+        self.assertEqual((r["rev"], r["item"]["history"][-1]["change"]), (1, "derivedFrom 추가"))
+        self.assertTrue(self.item("set", b, "--set", f"derivedFrom={ref_a}")["unchanged"])  # 같은 연결은 다시 쓰지 않는다(중복 없음)
+        # 역방향은 저장 없이 계산한다. 원본 자체·번호·상태는 그대로다(전파 없음)
+        origin = self.item("get", a)
+        self.assertEqual({x["id"] for x in origin["derivedItems"]}, {kid, b})
+        self.assertNotIn("derivedFrom", origin["item"])
+        self.assertEqual((origin["rev"], origin["item"]["status"]), (0, status_a))
+        self.assertEqual({k: v for k, v in rd(st)["refs"]["map"].items() if k != kid}, refs0["map"])  # 기존 번호 보존
+        self.assertEqual(self.item("get", kid)["derivedItems"], [])
+        # 자기 연결·순환·없는 대상·PR·문자열 아닌 값은 거절하고 아무것도 쓰지 않는다
+        before = slurp(self.data)
+        for args in ((a, "--set", f"derivedFrom={a}"), (a, "--set", f"derivedFrom={ref_a}"), (a, "--set", f"derivedFrom={kid}"),
+                     (a, "--set", "derivedFrom=w-00000000"), (a, "--set", "derivedFrom=HQ-999999"), (a, "--set", "derivedFrom=pr-1")):
+            self.assertEqual(self.cli_fail("item", "set", *args).returncode, 1, args)
+        self.assertEqual(self.cli_fail("item", "set", a, "--file", self._f({"derivedFrom": [q]})).returncode, 1)
+        self.assertEqual(self.cli_fail("item", "add", "work", "--set", "title=t", "--set", "status=s", "--set", "derivedFrom=w-00000000").returncode, 1)
+        self.assertEqual(slurp(self.data), before)
+        # 긴 사슬의 순환도 막는다: q → kid → a 인데 a → q 거절
+        self.item("set", q, "--set", f"derivedFrom={kid}")
+        self.assertEqual(self.cli_fail("item", "set", a, "--set", f"derivedFrom={q}").returncode, 1)
+        # 숨긴 항목: 연결은 유지하고 되살리지 않는다. 공개 응답에서 숨긴 쪽만 빠지고 CLI 역방향은 hidden으로 알려 준다
+        self.assertEqual(self.post(self.req(("work", b)))[0], 201)
+        self.cli("process-inbox")
+        self.assertEqual(rd(self.data)["work"][1]["derivedFrom"], a)
+        view = self.get("/api/dashboard")[1]["data"]["work"]
+        self.assertEqual([w["id"] for w in view if w.get("derivedFrom") == a], [kid])
+        self.assertEqual({x["id"]: x["hidden"] for x in self.item("get", a)["derivedItems"]}, {kid: False, b: True})
+        self.assertEqual(self.item("set", kid, "--set", f"derivedFrom={b}")["item"]["derivedFrom"], b)  # 숨긴 항목도 원본이 될 수 있다
+        # 해소된 결정도 원본이 될 수 있고, 파생 연결만으로 '해소된 결정 언급' 경고를 내지 않는다
+        self.item("resolve", dec, "--source", "chat:2030-02-01", "--reason", "확정")
+        w = self.item("add", "work", file={"title": "결정 파생", "status": "대기", "state": "waiting_user", "derivedFrom": dec})["id"]
+        self.assertEqual([x["id"] for x in self.item("get", dec)["derivedItems"]], [w])
+        self.assertNotIn(w, [x["id"] for x in self.cli("check")["warnings"] if x["code"] == "waiting-on-resolved-decision"])
+        # 해제할 연결이 없으면 변경이 아니다(rev·이력·빈 키를 남기지 않는다)
+        free = self.item("add", "work", file={"title": "연결 없음", "status": "진행 중", "derivedFrom": ""})
+        self.assertNotIn("derivedFrom", free["item"])
+        again = self.item("set", free["id"], "--set", "derivedFrom=")
+        self.assertTrue(again["unchanged"]); self.assertEqual(again["rev"], 1); self.assertNotIn("derivedFrom", again["item"])
+        # 해제는 빈 값이며 역방향도 사라진다
+        self.item("set", kid, "--set", "derivedFrom=")
+        self.assertNotIn(kid, [x["id"] for x in self.item("get", b)["derivedItems"]])
+        # 대상이 사라진 연결(손 편집)은 check 경고다
+        raw = rd(self.data); raw["work"][0]["derivedFrom"] = "w-00000000"; wr(self.data, raw)
+        self.assertEqual([x["id"] for x in self.cli("check")["warnings"] if x["code"] == "relation-target-missing"], [a])
+
     # ---------- check / summary ----------
     def tree(self):
         out = {}

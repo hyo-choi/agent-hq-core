@@ -1,16 +1,17 @@
 // /api/dashboard 응답(server.py view)의 형태. 서버 계약을 그대로 옮긴 것이며, 화면이 쓰는 필드만 적는다
 // state는 server.py item CLI가 쓰는 업무 상태다. 없으면(legacy) status 문자열로 묶는다(model.ts itemGroup)
 export type State = 'open' | 'blocked' | 'waiting_user' | 'done' | 'closed' | 'dropped';
-export interface Work { id?: string; title: string; status: string; state?: State; conclusion?: string; verification?: string; remaining?: string; prs?: (number | string)[] }
+// derivedFrom: 이 항목이 파생된 원본의 내부 id. 이동용 연결일 뿐 부모자식·상태 전파 의미가 없고, 역방향은 화면에서 계산한다
+export interface Work { id?: string; title: string; status: string; state?: State; conclusion?: string; verification?: string; remaining?: string; prs?: (number | string)[]; derivedFrom?: string }
 export interface Question {
   id?: string; q: string; status: string; state?: State; answer?: string; category?: string; thread?: string; updatedAt?: string;
-  evidence?: { label: string; url: string }[]; history?: { at: string; change: string; reason: string }[];
+  evidence?: { label: string; url: string }[]; history?: { at: string; change: string; reason: string }[]; derivedFrom?: string;
 }
 export interface Pr {
   id: string; number: number; title?: string; url?: string; state?: string; isDraft?: boolean; ok?: boolean;
   mergedAt?: string; updatedAt?: string; observedAt?: string; failedAt?: string;
 }
-export interface Decision { id?: string; title: string; detail?: string; waiting?: string }
+export interface Decision { id?: string; title: string; detail?: string; waiting?: string; derivedFrom?: string }
 // 사용자 결정이 끝난 결정. coordinator가 pendingDecisions에서 옮겨 원본 id를 보존한다(읽기 전용 표시)
 export interface ResolvedDecision extends Decision { status?: string; resolvedAt?: string; decisionSource?: string }
 export interface JiraIssue {

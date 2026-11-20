@@ -4,7 +4,7 @@ import { useLayoutEffect, useRef } from 'preact/hooks';
 import { useApp } from '../ctx';
 import { copyText } from '../lib/api';
 import { mdHtml } from '../lib/md';
-import { BADGE, STATE_NAME, itemGroup, safeUrl } from '../lib/model';
+import { BADGE, KIND, STATE_NAME, itemGroup, resolvedItems, safeUrl } from '../lib/model';
 import type { Item } from '../lib/types';
 
 type Kids = { children?: ComponentChildren };
@@ -68,6 +68,16 @@ export function RefBtn({ id, label, go }: { id?: string | null; label: string; g
     title={go ? `${r}로 이동` : `${r} 복사`} aria-label={go ? `${r}로 이동: ${label}` : `번호 ${r} 복사: ${label}`}
     onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') e.stopPropagation(); }}
     onClick={async e => { e.preventDefault(); e.stopPropagation(); if (go) return go(); if (await copyText(r)) toast(`${r} 번호를 복사했습니다.`); else openDialog(<ManualCopy text={r} />); }}>{r}</button>;
+}
+
+// 다른 항목으로 이동하는 버튼(추천의 관련 항목, 카드의 원본·파생). HQ 번호가 없는 id는 그리지 않고, 목록에 없는(숨김·merged) 항목은 누르면 이유만 알린다
+export function RelBtn({ id, rel = '관련' }: { id: string; rel?: string }) {
+  const { it, snap, refOf, revealId } = useApp(), ref = refOf(id);
+  if (!ref) return null;
+  const x = [...Object.values(it).flat(), ...resolvedItems(snap)].find(x => x.id === id);
+  return <button class="btn btn-xs btn-soft btn-primary" type="button" data-related={id} title={x ? `${KIND[x.kind]} 탭에서 ${ref} 보기` : `${ref}: 지금 진행판 목록에 없음(누르면 이유 안내)`}
+    aria-label={x ? `${rel} ${ref} ${KIND[x.kind]} 탭에서 보기: ${x.label}` : `${rel} ${ref} 목록에 없음, 이유 보기`} onClick={() => revealId(id)}>
+    <span class="font-mono">{rel + ' ' + ref}</span><span class="opacity-70">{x ? KIND[x.kind] + ' 보기' : '목록에 없음'}</span></button>;
 }
 
 // 묶음 전체 선택. 대상은 지금 화면(검색·필터 결과)에 보이는 항목 중 id가 있고 삭제 요청 대기가 아닌 것만이다.

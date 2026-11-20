@@ -593,6 +593,53 @@ describe('App', () => {
     fireEvent.click(await screen.findByLabelText('관련 HQ-40 목록에 없음, 이유 보기'));
     expect(await screen.findByText(/merged로 확인된 PR이라/)).toBeTruthy();
   });
+  it('파생 관계는 원본·파생 카드 양쪽에서 서로 이동한다(저장은 파생 쪽 하나)', async () => {
+    snap.data.work.push({ id: 'w-2', title: '파생 작업', status: '진행 중', derivedFrom: 'w-1' });
+    snap.data.questions = [{ id: 'q-1', q: '파생 질문', status: '조사 중', derivedFrom: 'w-1' }];
+    snap.refs['w-2'] = 'HQ-3'; snap.refs['q-1'] = 'HQ-4';
+    sessionStorage.setItem('tab', '"work"');
+    render(<App />);
+    await screen.findByText('파생 작업');
+    const rel = (id: string) => [...document.querySelectorAll(`[data-item="${id}"] [data-related]`)].map(b => b.getAttribute('data-related'));
+    expect(rel('w-1')).toEqual(['w-2', 'q-1']);
+    expect(rel('w-2')).toEqual(['w-1']);
+    fireEvent.click(screen.getByLabelText('파생 HQ-4 질문 탭에서 보기: 파생 질문'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="q-1"]')?.classList.contains('ring-2')).toBe(true));
+    expect(sessionStorage.getItem('tab')).toBe('"question"');
+    fireEvent.click(screen.getByLabelText('원본 HQ-1 작업 탭에서 보기: 작업 하나'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="w-1"]')?.classList.contains('ring-2')).toBe(true));
+    expect(sessionStorage.getItem('tab')).toBe('"work"');
+    fireEvent.input(screen.getByPlaceholderText('제목·내용·HQ 번호 검색'), { target: { value: '작업 하나' } });  // 필터에 걸린 대상은 HQ 번호 검색으로 찾는다
+    await waitFor(() => expect(document.querySelector('[data-item="w-2"]')).toBeNull());
+    fireEvent.click(screen.getByLabelText('파생 HQ-3 작업 탭에서 보기: 파생 작업'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="w-2"]')?.classList.contains('ring-2')).toBe(true));
+    expect((screen.getByPlaceholderText('제목·내용·HQ 번호 검색') as HTMLInputElement).value).toBe('HQ-3');
+  });
+  it('결정 완료 카드도 파생 관계로 오가고, 숨긴 원본은 되살리지 않으며 연결 없는 카드에는 버튼이 없다', async () => {
+    snap.data.work.push({ id: 'w-2', title: '결정 파생', status: '진행 중', derivedFrom: 'd-0000dec1' }, { id: 'w-3', title: '숨은 원본 파생', status: '진행 중', derivedFrom: 'w-gone' }, { id: 'w-4', title: '번호 없는 원본', status: '진행 중', derivedFrom: 'w-noref' });
+    snap.refs['w-2'] = 'HQ-3'; snap.refs['w-3'] = 'HQ-5'; snap.refs['w-4'] = 'HQ-6'; snap.refs['w-gone'] = 'HQ-7';
+    snap.requests = [{ requestId: 'r', status: 'done', items: [{ kind: 'work', id: 'w-gone', label: 'x' }] }];
+    sessionStorage.setItem('tab', '"work"');
+    render(<App />);
+    await screen.findByText('결정 파생');
+    expect(document.querySelector('[data-item="w-1"] [data-relations]')).toBeNull();
+    expect(document.querySelector('[data-item="w-4"] [data-related]')).toBeNull();  // HQ 번호 없는 id는 버튼 없음
+    fireEvent.click(screen.getByLabelText('원본 HQ-7 목록에 없음, 이유 보기'));
+    expect(await screen.findByText(/삭제 요청으로 진행판에서 숨긴 항목/)).toBeTruthy();
+    expect(sessionStorage.getItem('tab')).toBe('"work"');
+    fireEvent.click(screen.getByLabelText('원본 HQ-30 결정 탭에서 보기: 합성 결정 통합'));  // 접힌 결정 완료 묶음을 펼쳐 보여 준다
+    await waitFor(() => expect(document.querySelector('#list [data-item="d-0000dec1"]')?.classList.contains('ring-2')).toBe(true));
+    fireEvent.click(screen.getByLabelText('파생 HQ-3 작업 탭에서 보기: 결정 파생'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="w-2"]')?.classList.contains('ring-2')).toBe(true));
+  });
+  it('숨긴 결정 완료 파생 항목은 원본 카드에 나오지 않는다', async () => {
+    snap.data.resolvedDecisions[0].derivedFrom = 'w-1';
+    snap.requests = [{ requestId: 'r', status: 'done', items: [{ kind: 'decision', id: 'd-0000dec1', label: 'x' }] }];
+    sessionStorage.setItem('tab', '"work"');
+    render(<App />);
+    await screen.findByText('작업 하나');
+    expect(document.querySelector('[data-item="w-1"] [data-relations]')).toBeNull();
+  });
   it('추천의 관련 항목이 숨김이면 되살리지 않고 이유만 안내한다', async () => {
     snap.data.recommendations = { items: [{ id: 'rec-h', title: '숨김 관련', related: ['d-0000dec1'] }] };
     snap.requests = [{ requestId: 'r', status: 'done', items: [{ kind: 'decision', id: 'd-0000dec1', label: 'x' }] }];

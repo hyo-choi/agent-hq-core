@@ -2,11 +2,11 @@
 import type { ComponentChildren } from 'preact';
 import { useRef } from 'preact/hooks';
 import { useApp } from '../ctx';
-import { CATS, KIND, fmt, itemGroup, matches, prBadge, prState, resolvedItems, type Items } from '../lib/model';
+import { CATS, KIND, fmt, hiddenIds, itemGroup, matches, prBadge, prState, resolvedItems, type Items } from '../lib/model';
 import type { Item } from '../lib/types';
 import { AskDelete } from './Dialogs';
 import { MsgBox } from './Messages';
-import { A, Badge, DecideBadge, Det, Dl, Empty, Fold, GROUP, GroupChk, ListBox, Md, Muted, RefBtn, SelectRow, StatusBadge } from './ui';
+import { A, Badge, DecideBadge, Det, Dl, Empty, Fold, GROUP, GroupChk, ListBox, Md, Muted, RefBtn, RelBtn, SelectRow, StatusBadge } from './ui';
 
 // 목록 한 행. head가 있으면 기본 머리(번호·상태) 대신 쓴다(요청함 메시지 행)
 export function Card({ x, head, title, lead, leadCls, children }: {
@@ -64,8 +64,15 @@ function Detail({ x }: { x: Item }) {
   return <Det k={'d:' + x.id} summary="자세히"><Dl rows={[['내용', md(r.detail)], ['대기 범위', md(r.waiting)]]} />
     <Muted cls="mt-2">이 항목을 진행판에서 숨겨도 결정이나 승인으로 간주하지 않습니다.</Muted></Det>;
 }
+// 원본(derivedFrom)과, 이 항목을 원본으로 적은 파생 항목으로 오가는 버튼. 역방향은 저장하지 않고 응답에서 계산하며, 숨긴 파생 항목은 나오지 않는다(결정 완료는 서버가 걸러 주지 않아 여기서 뺀다)
+function Relations({ x }: { x: Item }) {
+  const { snap } = useApp(), d = snap.data, org = x.raw.derivedFrom as string | undefined, hid = hiddenIds(snap);
+  const kids = [...(d.work || []), ...(d.questions || []), ...(d.pendingDecisions || []), ...(d.resolvedDecisions || [])].filter(o => x.id && o.id && o.derivedFrom === x.id && !hid.has(o.id));
+  if (!org && !kids.length) return null;
+  return <div class="mt-2 flex flex-wrap gap-1.5" data-relations>{org ? <RelBtn key={org} id={org} rel="원본" /> : null}{kids.map(o => <RelBtn key={o.id} id={o.id!} rel="파생" />)}</div>;
+}
 const RowsBase = ({ xs, live }: { xs: Item[]; live?: Map<string | undefined, Item> }) => <ListBox>{xs.map(x0 => { const x = live?.get(x0.id) || x0;
-  return <Card key={x.id || x.label} x={x}><Detail x={x} /><MsgBox x={x} /></Card>; })}</ListBox>;
+  return <Card key={x.id || x.label} x={x}><Relations x={x} /><Detail x={x} /><MsgBox x={x} /></Card>; })}</ListBox>;
 
 export function ListTab({ tab }: { tab: 'work' | 'question' | 'pr' | 'decision' }) {
   const { it: liveIt, snap, refOf, filters, pend, editing } = useApp(), D = snap.data;
@@ -118,7 +125,7 @@ export function ListTab({ tab }: { tab: 'work' | 'question' | 'pr' | 'decision' 
     if (rs.length) nodes.push(<Fold key="resolved" k="resolved" cls={GROUP} force={!!q} head={<><GroupChk label="결정 완료" xs={rs} text="전체 선택" /><span class="font-semibold">결정 완료</span><Badge cls="badge-success">{rs.length + '건'}</Badge>
       <span class="basis-full text-sm font-normal text-base-content/60">사용자가 결정을 마친 항목입니다. 숨겨도 원본 기록·결정 내용·번호는 그대로 보존합니다.</span></>}>
       <ListBox>{rs.map(x => <Card key={x.id || x.label} x={x} head={<><RefBtn id={x.id} label={x.label} /><Badge cls="badge-success">{x.status}</Badge>
-        {x.raw.resolvedAt ? <span class="text-xs text-base-content/60">{fmt(x.raw.resolvedAt)}</span> : null}</>}><Detail x={x} /><MsgBox x={x} /></Card>)}</ListBox></Fold>);
+        {x.raw.resolvedAt ? <span class="text-xs text-base-content/60">{fmt(x.raw.resolvedAt)}</span> : null}</>}><Relations x={x} /><Detail x={x} /><MsgBox x={x} /></Card>)}</ListBox></Fold>);
   }
   if (!xs.length && !limHit) nodes.unshift(<Empty key="empty">조건에 맞는 항목이 없습니다.</Empty>);
   return <>{nodes}</>;
