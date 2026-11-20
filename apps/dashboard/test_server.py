@@ -1509,7 +1509,7 @@ s.Handler.log_message = log
         self.cli("flush", "done", "--id", self.cli("flush", "status")["flushes"][-1]["flushId"])
         reg = self.cli("flush", "register", "--provider", "codex", "--thread", THREAD, "--evidence", "e")["registration"]
         self.assertEqual(reg["previous"], {"provider": "claude", "thread": sid})
-        box = rd(os.path.join(self.root, "private", "flush.json")); box["flushes"][-1]["createdAt"] = "2020-01-01T00:00:00+09:00"
+        box = rd(os.path.join(self.root, "private", "flush.json")); box["flushes"][-1]["createdAt"] = "2001-01-01T00:00:00Z"
         wr(os.path.join(self.root, "private", "flush.json"), box)  # cooldown 통과
         self.assertEqual(self.flush()[1]["flush"]["status"], "queued")
         self.assertEqual(len(self.codex_calls()), 1); self.assertEqual(len(lines), 2)
@@ -1522,7 +1522,7 @@ s.Handler.log_message = log
         self.assertEqual(first["status"], "queued")
         self.assertEqual(self.flush()[1]["duplicate"], True)  # 같은 등록 안에서는 여전히 중복이다
         self.assertEqual(self.register_self(self.self_env(sid, sock, "tokB")).returncode, 0)  # 같은 session id, 새 토큰(resume)
-        box = rd(os.path.join(self.root, "private", "flush.json")); box["flushes"][-1]["createdAt"] = "2020-01-01T00:00:00+09:00"
+        box = rd(os.path.join(self.root, "private", "flush.json")); box["flushes"][-1]["createdAt"] = "2001-01-01T00:00:00Z"
         wr(os.path.join(self.root, "private", "flush.json"), box)  # 이전 요청을 오래된 것으로 만든다(cooldown 통과, 재등록 전 요청)
         self.assertFalse(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
         code, r = self.flush()

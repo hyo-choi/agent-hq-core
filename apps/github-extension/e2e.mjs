@@ -42,7 +42,7 @@ fs.writeFileSync(path.join(bin, "codex"), '#!/bin/sh\n[ -f "$HQ_DASH_ROOT/codex-
 fs.writeFileSync(path.join(bin, "gh"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
 const pr = (n, state, repo = "example-org/demo-repo", extra = {}) => ({ number: n, title: `합성 PR ${n}`, state, isDraft: state === "OPEN", ok: true, url: `https://github.com/${repo}/pull/${n}`, ...extra });
 fs.writeFileSync(path.join(root, "public/data.json"), JSON.stringify({
-  updatedAt: "2030-02-01T00:00:00Z", updatedBy: "e2e", prsCheckedAt: new Date(Date.now() + 9 * 3600e3).toISOString().replace(/\.\d+Z$/, "+09:00"), // 지금 시각(KST). 5분 안에는 자동 조회가 돌지 않는다
+  updatedAt: "2030-02-01T00:00:00Z", updatedBy: "e2e", prsCheckedAt: new Date().toISOString(), // 방금 관찰한 스냅샷이므로 5분 안에는 자동 조회가 돌지 않는다
   work: [{ title: "합성 작업", status: "진행 중", state: "open", prs: [41] }, { title: "미등록 PR 작업", status: "진행 중", state: "open", prs: [999] }],
   questions: [{ q: "합성 질문?", status: "조사 중", prs: [41] }],
   pendingDecisions: [{ title: "합성 결정", detail: "d", waiting: "w", prs: [41] }],
@@ -111,23 +111,23 @@ const version = (await cdp("Browser.getVersion")).product;
 const { id: extId } = await cdp("Extensions.loadUnpacked", { path: ext });
 assert.match(extId, /^[a-p]{32}$/); // key 없이 Chrome이 정한 ID를 그대로 서버에 등록한다
 
-// 합성 GitHub DOM fixture. 선택자는 공개 API 계약이 아니므로 변경되면 재검증한다.
+// 공개 GitHub 화면의 selector를 검증하기 위한 최소 합성 구조.
 const listRow = (n, author, kind = "pull", repo = "example-org/demo-repo") => `<li><div data-listview-item-title-container="true"><h3><a data-testid="listitem-title-link" href="https://github.com/${repo}/${kind}/${n}"><span>목록 제목 ${n}</span></a></h3><span></span></div><div>#${n} · <a data-testid="author-filter-link" href="/${repo}/pulls?q=author%3A${author}">${author}</a> opened</div></li>`;
 const LIST_ROWS = `<ul role="list">${listRow(41, "Me-User")}${listRow(124, "someone-else")}${listRow(5, "me-user", "issues")}${listRow(999, "me-user")}</ul>`;
-// 합성 GitHub DOM fixture. 선택자는 공개 API 계약이 아니므로 변경되면 재검증한다.
+// 공개 GitHub 화면의 selector를 검증하기 위한 최소 합성 구조.
 const prHeader = (n) => `<header data-component="SplitPageLayout.Header"><div data-component="PageHeader"><div data-component="TitleArea"><h1>합성 PR ${n}</h1></div><div data-component="PageHeader.Description"><span>Open</span></div></div></header>`;
 const classicHeader = (n) => `<div class="gh-header-show"><h1 class="gh-header-title">합성 PR ${n}</h1><div class="gh-header-meta d-flex">Open</div></div>`;
-// 합성 GitHub DOM fixture. 선택자는 공개 API 계약이 아니므로 변경되면 재검증한다.
+// 공개 GitHub 화면의 selector를 검증하기 위한 최소 합성 구조.
 // permalink는 a.js-timestamp#<id>-permalink, 변경 파일 탭의 리뷰 코멘트는 href가 #r<n>이고 id 요소가 없다. 리뷰 요약이 없는 리뷰 머리에는 본문이 없다.
 // 타임라인은 turbo-frame#repo-content-turbo-frame 안에 있고, 같은 frame에 /<레포>/pull/<번호>/...를 가리키는 data-url이 있다
-const cmt = (id, author, body, href = `#${id}`) => `<div class="timeline-comment-group"><div class="timeline-comment"><div class="d-flex"><strong><a class="author" href="/${author}">${author}</a></strong><a href="${href}" id="${id}-permalink" class="Link--secondary js-timestamp">Nov 1</a></div><div class="comment-body markdown-body">${body}</div></div></div>`;
-const inline = (n, body, files) => `<div ${files ? "" : `id="discussion_r${n}" `}class="timeline-comment-group"><div class="review-comment"><a class="author" href="/reviewer">reviewer</a><a href="${files ? `#r${n}` : `#discussion_r${n}`}" id="discussion_r${n}-permalink" class="Link--secondary js-timestamp">Nov 3</a><div class="comment-body markdown-body">${body}</div></div></div>`;
+const cmt = (id, author, body, href = `#${id}`) => `<div class="timeline-comment-group"><div class="timeline-comment"><div class="d-flex"><strong><a class="author" href="/${author}">${author}</a></strong><a href="${href}" id="${id}-permalink" class="Link--secondary js-timestamp">permalink</a></div><div class="comment-body markdown-body">${body}</div></div></div>`;
+const inline = (n, body, files) => `<div ${files ? "" : `id="discussion_r${n}" `}class="timeline-comment-group"><div class="review-comment"><a class="author" href="/reviewer">reviewer</a><a href="${files ? `#r${n}` : `#discussion_r${n}`}" id="discussion_r${n}-permalink" class="Link--secondary js-timestamp">permalink</a><div class="comment-body markdown-body">${body}</div></div></div>`;
 const frame = (n, inner) => `<turbo-frame id="repo-content-turbo-frame"><div data-url="/example-org/demo-repo/pull/${n}/partials/body"></div>${inner}</turbo-frame>`;
 const TIMELINE = `<div id="issue-1" class="js-comment">${cmt("issue-1", "me-user", "<p>PR 본문</p>")}</div>`
   + `<div id="issuecomment-11" class="js-comment">${cmt("issuecomment-11", "reviewer", "<p>일반 댓글 &lt;img src=x onerror=alert(1)&gt;</p><p>둘째 문단</p>")}</div>`
-  + `<div id="pullrequestreview-21" class="js-comment"><span class="color-fg-muted"><a href="#pullrequestreview-21" id="pullrequestreview-21-permalink" class="js-timestamp Link--secondary">Nov 3</a></span><a class="author" href="/reviewer">reviewer</a><div class="timeline-comment-group"><div class="comment-body markdown-body">리뷰 요약</div></div>${inline(31, "인라인 코멘트: 여기 null 체크")}</div>`
-  + `<div id="pullrequestreview-22" class="js-comment"><span class="color-fg-muted"><a href="#pullrequestreview-22" id="pullrequestreview-22-permalink" class="js-timestamp Link--secondary">Nov 4</a></span>${inline(32, "요약 없는 리뷰의 코멘트")}</div>`
-  + `<div class="TimelineItem"><a href="#ref-commit-abc" class="Link--secondary">Nov 5</a></div>`;
+  + `<div id="pullrequestreview-21" class="js-comment"><span class="color-fg-muted"><a href="#pullrequestreview-21" id="pullrequestreview-21-permalink" class="js-timestamp Link--secondary">permalink</a></span><a class="author" href="/reviewer">reviewer</a><div class="timeline-comment-group"><div class="comment-body markdown-body">리뷰 요약</div></div>${inline(31, "인라인 코멘트: 여기 null 체크")}</div>`
+  + `<div id="pullrequestreview-22" class="js-comment"><span class="color-fg-muted"><a href="#pullrequestreview-22" id="pullrequestreview-22-permalink" class="js-timestamp Link--secondary">permalink</a></span>${inline(32, "요약 없는 리뷰의 코멘트")}</div>`
+  + `<div class="TimelineItem"><a href="#ref-commit-abc" class="Link--secondary">permalink</a></div>`;
 const FILES_THREADS = `${inline(31, "인라인 코멘트: 여기 null 체크", true)}${inline(32, "요약 없는 리뷰의 코멘트", true)}`;
 const stubPage = (url) => {
   const { pathname, search } = new URL(url);
@@ -186,7 +186,7 @@ class Popup {
   close() { return cdp("Target.closeTarget", { targetId: this.targetId }).then(() => sleep(150)); }
 }
 
-// 합성 GitHub DOM fixture. 선택자는 공개 API 계약이 아니므로 변경되면 재검증한다.
+// 브라우저 action 경로로 popup을 열어 원래의 activeTab 권한을 확인한다.
 async function open(url, ready = true, keepFlush = false) {
   if (url) await goto(url);
   const tab = await ghTab();
