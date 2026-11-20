@@ -32,6 +32,151 @@ const refresh = () => act(async () => { document.dispatchEvent(new Event('visibi
 const tabBtn = (name: string) => screen.getAllByRole('tab').find(b => b.textContent!.startsWith(name))!;
 
 describe('App', () => {
+  it('질문 답변과 추천 본문에도 소제목 규칙을 적용하고 빈 검증은 생략한다', async () => {
+    snap.data.questions = [{ id: 'q-fold', q: '질문 접기', status: '조사 중', answer: '### 알아 두실 점\n질문 정보\n\n### 필요한 결정\n질문 선택' }];
+    snap.data.recommendations = { updatedAt: new Date().toISOString(), items: [{ id: 'rec-fold', title: '추천 접기', why: '### 배경\n추천 정보', action: '### 정해 주실 것\n추천 행동' }] };
+    sessionStorage.setItem('tab', '"home"');
+    render(<App />);
+    const fold = (title: string) => screen.getByText(title, { selector: 'summary > span:first-child' }).closest('details') as HTMLDetailsElement;
+    await screen.findByText('배경', { selector: 'summary > span:first-child' });
+    expect(fold('배경').open).toBe(false);
+    expect(fold('정해 주실 것').open).toBe(true);
+    fireEvent.click(tabBtn('질문'));
+    await screen.findByText('알아 두실 점', { selector: 'summary > span:first-child' });
+    expect(fold('알아 두실 점').open).toBe(true);
+    expect(fold('필요한 결정').open).toBe(true);
+    fireEvent.click(tabBtn('작업'));
+    await screen.findByText('작업 하나', { selector: 'h3' });
+    expect(screen.queryByText('검증', { selector: 'summary > span:first-child' })).toBeNull();
+  });
+  it('기본 펼침 본문과 사용자가 펼친 본문을 상세 모두 닫기로 닫고 재마운트에도 유지한다', async () => {
+    snap.data.recommendations = { items: [{ id: 'rec-close', title: '접기 검증', why: '### 다음 행동\n행동 본문\n\n### 배경\n정보 본문' }] };
+    const { unmount } = render(<App />);
+    await screen.findByText('다음 행동', { selector: 'summary > span:first-child' });
+    const fold = (name: string) => screen.getByText(name, { selector: 'summary > span:first-child' }).closest('details') as HTMLDetailsElement;
+    await waitFor(() => expect((screen.getByText('상세 모두 닫기') as HTMLButtonElement).disabled).toBe(false));
+    await act(async () => { fold('배경').open = true; fireEvent(fold('배경'), new Event('toggle')); });
+    fireEvent.click(screen.getByText('상세 모두 닫기'));
+    await waitFor(() => expect([fold('다음 행동').open, fold('배경').open]).toEqual([false, false]));
+    unmount(); render(<App />);
+    await screen.findByText('다음 행동', { selector: 'summary > span:first-child' });
+    expect([fold('다음 행동').open, fold('배경').open]).toEqual([false, false]);
+  });
+  it('직접 확인할 제목과 하위 행동 제목에 배지를 표시하고 Shift+X 뒤에도 구분을 유지한다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["d:w-1"]');
+    snap.data.work[0].conclusion = '### [확인해 주실 것](https://example.com/check)\n직접 행동\n\n### 배경\n정보 본문\n\n### 검토 결과\n#### 다음 행동\n하위 행동';
+    snap.data.work[0].verification = '### 필요한 결정\n검증 안의 제목';
+    render(<App />);
+    await screen.findByText('배경', { selector: 'summary > span:first-child' });
+    const folds = () => [...document.querySelectorAll<HTMLDetailsElement>('[data-md-fold]')];
+    const assertMarkers = () => {
+      expect(folds().map(d => !!d.querySelector('summary .badge'))).toEqual([true, false, true, false]);
+      expect(folds().map(d => d.querySelector('summary')!.classList.contains('text-base-content/60'))).toEqual([false, true, false, true]);
+      for (const d of [folds()[0], folds()[2]]) expect(d.querySelector('summary .sr-only')!.textContent).toBe('직접 확인할 섹션');
+      const link = folds()[0].querySelector('summary a')!;
+      expect([link.getAttribute('href'), link.getAttribute('target')]).toEqual(['https://example.com/check', '_blank']);
+    };
+    expect(folds().map(d => d.open)).toEqual([true, false, true, false]);
+    assertMarkers();
+    fireEvent.keyDown(document, { key: 'X', shiftKey: true });
+    await waitFor(() => expect(folds().every(d => !d.open)).toBe(true));
+    assertMarkers();
+  });
+  it('바깥 상세는 실제 행동 섹션 수를 표시하고 모두 닫은 뒤에도 남기며 정보성 카드에는 생략한다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["d:w-1"]');
+    snap.data.work[0].conclusion = '### 확인해 주실 것\n행동\n\n### 검토 결과\n#### 다음 행동\n하위 행동\n#### 꼭 확인\n같은 섹션';
+    snap.data.work[0].remaining = '### 추천\n다음 작업';
+    snap.data.work[0].verification = '### 필요한 결정\n검증은 정보성';
+    snap.data.work.push({ id: 'w-info', title: '정보성 작업', status: '진행 중', conclusion: '### 배경\n정보', verification: '### 필요한 결정\n검증 제목' });
+    render(<App />);
+    await screen.findByText('정보성 작업', { selector: 'h3' });
+    const summary = (id: string) => document.querySelector(`[data-item="${id}"] details > summary`)!;
+    const check = () => {
+      expect(summary('w-1').querySelector('.badge [aria-hidden]')!.textContent).toBe('확인 3');
+      expect(summary('w-1').querySelector('.sr-only')!.textContent).toBe('직접 확인할 섹션 3개');
+      expect(summary('w-info').querySelector('.badge')).toBeNull();
+    };
+    check();
+    fireEvent.keyDown(document, { key: 'X', shiftKey: true });
+    await waitFor(() => expect((summary('w-1').parentElement as HTMLDetailsElement).open).toBe(false));
+    check();
+    snap.data.work[0].conclusion = '### 배경\n변경된 정보'; snap.data.work[0].remaining = '';
+    await refresh();
+    expect(summary('w-1').querySelector('.badge')).toBeNull();
+  });
+  it('질문 답변과 미결·완료 결정의 바깥 상세에도 같은 섹션 수를 표시한다', async () => {
+    snap.data.questions = [{ id: 'q-action', q: '행동 질문', status: '조사 중', answer: '### 배경\n정보\n### 검토\n#### 다음 행동\n행동' }];
+    snap.data.pendingDecisions[0].detail = '### 필요한 결정\n결정';
+    snap.data.pendingDecisions[0].waiting = '### 선택지\n선택';
+    snap.data.resolvedDecisions[0].detail = '### 알아 두실 점\n결정 결과';
+    sessionStorage.setItem('tab', '"question"');
+    render(<App />);
+    await screen.findByText('Q. 행동 질문', { selector: 'h3' });
+    const count = (id: string) => document.querySelector(`[data-item="${id}"] details > summary .badge [aria-hidden]`)!.textContent;
+    expect(count('q-action')).toBe('확인 1');
+    fireEvent.click(tabBtn('결정'));
+    await screen.findByText('대기 결정', { selector: 'h3' });
+    expect(count('d-1')).toBe('확인 2');
+    expect(count('d-0000dec1')).toBe('확인 1');
+  });
+  it('긴 본문은 소제목별 기본값과 검증 전체 접힘을 적용하고 갱신·재마운트 후 사용자 선택을 유지한다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["d:w-1"]');
+    snap.data.work[0].conclusion = '항상 보이는 서문\n\n### 해 주실 일\n직접 행동\n\n### 배경\n정보 본문';
+    snap.data.work[0].verification = '검증 본문\n\n### 검증 근거\n전체 블록 안의 글';
+    snap.data.work[0].remaining = '소제목 없는 남은 일';
+    const { unmount } = render(<App />);
+    await screen.findByText('항상 보이는 서문');
+    const fold = (name: string) => screen.getByText(name, { selector: 'summary > span:first-child' }).closest('details') as HTMLDetailsElement;
+    expect(fold('해 주실 일').open).toBe(true);
+    expect(fold('배경').open).toBe(false);
+    expect(fold('검증').open).toBe(false);
+    expect(screen.getByText('검증 근거').tagName).toBe('H3');
+    expect(screen.getByText('소제목 없는 남은 일').closest('[data-md-fold]')).toBeNull();
+    const toggle = (name: string, on: boolean) => { const d = fold(name); d.open = on; fireEvent(d, new Event('toggle')); };
+    toggle('해 주실 일', false); toggle('배경', true); toggle('검증', true);
+    await refresh();
+    expect(fold('해 주실 일').open).toBe(false);
+    expect(fold('배경').open).toBe(true);
+    expect(fold('검증').open).toBe(true);
+    unmount(); render(<App />);
+    await screen.findByText('항상 보이는 서문');
+    expect(fold('해 주실 일').open).toBe(false);
+    expect(fold('배경').open).toBe(true);
+    expect(fold('검증').open).toBe(true);
+  });
+  it('검색 중에는 접힌 상세와 본문을 펼치고 검색을 지우면 원래 선택으로 돌아간다', async () => {
+    sessionStorage.setItem('tab', '"work"');
+    snap.data.work[0].conclusion = '### 배경\n숨은 검색어';
+    snap.data.work[0].verification = '검색어 검증';
+    render(<App />);
+    await screen.findByText('배경', { selector: 'summary > span:first-child' });
+    const folds = () => [...document.querySelectorAll<HTMLDetailsElement>('[data-item="w-1"] details:has(dl), [data-item="w-1"] details[data-md-fold]')];
+    expect(folds().every(d => !d.open)).toBe(true);
+    const search = screen.getByPlaceholderText('제목·내용·HQ 번호 검색');
+    fireEvent.input(search, { target: { value: '검색어' } });
+    await waitFor(() => expect(folds().every(d => d.open)).toBe(true));
+    await refresh();
+    expect(folds().every(d => d.open)).toBe(true);
+    fireEvent.input(search, { target: { value: '' } });
+    await waitFor(() => expect(folds().every(d => !d.open)).toBe(true));
+  });
+  it('통합 검색의 보기 이동은 접힌 본문과 상위 상세를 모두 열어 내용을 찾게 한다', async () => {
+    location.hash = '#search';
+    snap.data.pendingDecisions[0].detail = '### 배경\n숨은 결정 근거';
+    render(<App />);
+    const search = await screen.findByPlaceholderText('작업·질문·PR·결정 전체에서 제목·내용·HQ·PR 번호 검색');
+    fireEvent.input(search, { target: { value: '숨은 결정 근거' } });
+    fireEvent.click(await screen.findByRole('button', { name: '결정 탭에서 보기: 대기 결정' }));
+    await waitFor(() => {
+      const folds = [...document.querySelectorAll<HTMLDetailsElement>('[data-item="d-1"] details:has(dl), [data-item="d-1"] details[data-md-fold]')];
+      expect(folds.length).toBe(2);
+      expect(folds.every(d => d.open)).toBe(true);
+    });
+    await refresh();
+    expect(document.querySelector<HTMLDetailsElement>('[data-md-fold]')!.open).toBe(true);
+  });
+
+
   it('Jira Sprint 묶음 안에서 일반 티켓·서브태스크·유형 미확인을 나누고 부모 번호만 링크로 붙인다', async () => {
     const iss = (key: string, extra: object) => ({ key, summary: key + ' 제목', status: 'READY', priority: 'High', sprint: 1, sprintIds: [1], ...extra });
     snap.data.jira = { site: 'https://x.atlassian.net', project: 'DEMO', sprintField: 'customfield_10001', observedAt: new Date().toISOString(),

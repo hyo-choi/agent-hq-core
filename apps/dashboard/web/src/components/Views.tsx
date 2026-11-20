@@ -5,7 +5,7 @@ import { useApp } from '../ctx';
 import { JKEY, JPRI, JST, KIND, ageMin, fmt, jiraUrl, matches, prBadge, resolvedItems } from '../lib/model';
 import type { Item, JiraIssue } from '../lib/types';
 import { PrLinks } from './Lists';
-import { Badge, Det, Empty, GROUP, ListBox, Muted, RefBtn, RelBtn, StatusBadge } from './ui';
+import { Badge, Det, Empty, GROUP, ListBox, Md, Muted, RefBtn, RelBtn, StatusBadge } from './ui';
 
 // ---------- 다음 할 일 추천 (coordinator가 data.recommendations에 명시한 것만) ----------
 export function Recs({ gotoJira }: { gotoJira: (k: string) => void }) {
@@ -23,9 +23,9 @@ export function Recs({ gotoJira }: { gotoJira: (k: string) => void }) {
       <div class="flex flex-wrap items-center gap-2"><span class="badge badge-sm badge-neutral tabular-nums">{String(i + 1)}</span><RefBtn id={r.id} label={r.title} />
         {r.decision ? <Badge cls="badge-warning">사용자 결정 필요</Badge> : <Badge cls="badge-success">바로 할 수 있음</Badge>}</div>
       <h3 class="card-title text-base leading-snug">{r.title}</h3>
-      {r.why ? <p class="line-clamp-3 text-sm text-base-content/70">{r.why}</p> : null}
-      {r.action ? <p class="text-sm"><b>다음 행동 · </b>{r.action}</p> : null}
-      {r.decision ? <p class="rounded-field bg-warning/15 px-3 py-2 text-sm text-base-content">{r.decision}</p> : null}
+      {r.why ? <Md cls="text-sm text-base-content/70" text={r.why} foldKey={(r.id || r.title) + ":why"} /> : null}
+      {r.action ? <div class="text-sm"><b>다음 행동 · </b><Md text={r.action} foldKey={(r.id || r.title) + ":action"} /></div> : null}
+      {r.decision ? <Md cls="rounded-field bg-warning/15 px-3 py-2 text-sm text-base-content" text={r.decision} foldKey={(r.id || r.title) + ":decision"} /> : null}
       <div class="mt-auto flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-2 text-sm">
         {related(r).map(id => <RelBtn key={id} id={id} />)}
         <PrLinks nums={r.prs} />

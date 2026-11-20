@@ -1,6 +1,6 @@
 // Markdown 렌더 규칙: 지원 문법, raw HTML·위험 URL 차단, 이미지 미로드, 기존 plain 기록 호환
 import { describe, expect, it } from 'vitest';
-import { mdHtml, mdPlain } from './md';
+import { mdActionCount, mdHtml, mdPlain, mdSections } from './md';
 
 const dom = (t: string) => { const d = document.createElement('div'); d.innerHTML = mdHtml(t); return d; };
 
@@ -70,5 +70,59 @@ describe('mdHtml', () => {
     expect(mdPlain('#### 배경\n**추천** `A`\n\n| 선택지 | 영향 |\n| --- | --- |\n| A | 빠름 |\n\n```\ncode\n```')).toBe('배경 추천 A 선택지 영향 A 빠름');
     expect(mdPlain('plain 기록\n둘째 줄')).toBe('plain 기록 둘째 줄');
     expect(mdPlain(undefined)).toBe('');
+  });
+});
+
+describe('Markdown 소제목 접기', () => {
+  it('사용자 행동 표현만 기본으로 펼치고 소제목 앞 글을 보존한다', () => {
+    const { intro, sections } = mdSections('앞 안내\n\n' + ['해 주실', '확인해 주실', '정해 주실', '필요한 결정', '추천', '선택지', '막힌 이유', '주의하실', '꼭 확인', '머지 전에', '위험', '알아 두실', '필요한 선택', '우선 결정', '다음 행동'].map(s => `### ${s} 내용\n본문`).join('\n\n') + '\n\n### 배경\n정보');
+    expect(intro).toContain('<p>앞 안내</p>');
+    expect(sections.map(s => s.open)).toEqual([...Array(15).fill(true), false]);
+    expect(sections.at(-1)!.html).toContain('정보');
+    expect(mdSections('소제목 없는 본문')).toEqual({ intro: mdHtml('소제목 없는 본문'), sections: [] });
+  });
+  it('코드 블록·들여쓰기·인용문 안의 제목은 나누지 않고 참조 링크를 보존한다', () => {
+    const body = '```md\n### 코드 제목\n```\n\n~~~~\n### 다른 코드\n~~~~\n\n    ### 들여쓴 코드\n\n> ### 인용 제목\n\n### 배경\n[근거][ref]\n\n[ref]: https://example.com';
+    const { intro, sections } = mdSections(body);
+    expect(sections.map(s => s.title)).toEqual(['배경']);
+    expect(intro).toContain('### 코드 제목');
+    expect(intro).toContain('### 다른 코드');
+    expect(intro).toContain('### 들여쓴 코드');
+    expect(intro).toContain('<blockquote>');
+    expect(sections[0].html).toContain('href="https://example.com"');
+  });
+  it('제목 링크·강조·코드를 보존하며 plain 제목으로 규칙과 키를 판정한다', () => {
+    const s = mdSections('### [**필요한 결정** `A`](https://example.com)\n본문').sections[0];
+    expect(s.title).toBe('필요한 결정 A');
+    expect(s.open).toBe(true);
+    expect(s.titleHtml).toContain('href="https://example.com"');
+    expect(s.titleHtml).toContain('<strong>필요한 결정</strong>');
+    expect(s.titleHtml).toContain('<code>A</code>');
+    expect(s.titleHtml).toContain('target="_blank"');
+  });
+  it('h1·h2는 앞 h3의 접힘에 포함하지 않고 행동 하위 제목은 부모 섹션을 펼친다', () => {
+    const { sections } = mdSections('### 배경\n정보\n\n## 상위 제목\n바깥 내용\n\n### 구현\n#### 꼭 확인할 일\n행동\n\n# 또 다른 상위\n끝');
+    expect(sections[0].html).not.toContain('상위 제목');
+    expect(sections[0].after).toContain('<h2>상위 제목</h2>');
+    expect(sections[0].after).toContain('바깥 내용');
+    expect(sections[1].open).toBe(true);
+    expect(sections[1].html).toContain('<h4>꼭 확인할 일</h4>');
+    expect(sections[1].html).not.toContain('또 다른 상위');
+    expect(sections[1].after).toContain('<h1>또 다른 상위</h1>');
+    expect(mdSections('### 확인한 근거\n본문\n### 결정 기록\n기록').sections.every(s => !s.open)).toBe(true);
+  });
+  it('같은 이름의 소제목도 서로 다른 상태 키를 가진다', () => {
+    const { sections } = mdSections('### 배경\n첫째\n\n### 배경\n둘째');
+    expect(sections[0].key).not.toBe(sections[1].key);
+    expect(mdSections('### ---\n본문').sections[0].title).toBe('---');
+    expect(mdSections('### [추천][ref]\n내용\n\n[ref]: https://example.com').sections[0].title).toBe('추천');
+  });
+});
+
+describe('mdActionCount', () => {
+  it('빈 본문과 중첩·코드 제목을 제외하고 같은 렌더링 섹션 단위로 센다', () => {
+    expect(mdActionCount(undefined, null, '', '### 배경\n정보')).toBe(0);
+    expect(mdActionCount('### 검토\n#### 다음 행동\n행동\n#### 꼭 확인\n행동', '### 추천\n행동')).toBe(2);
+    expect(mdActionCount('```\n### 필요한 결정\n```\n\n> ### 다음 행동\n인용')).toBe(0);
   });
 });

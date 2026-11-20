@@ -4,9 +4,10 @@ import { useRef } from 'preact/hooks';
 import { useApp } from '../ctx';
 import { CATS, KIND, fmt, hiddenIds, itemGroup, matches, prBadge, prState, resolvedItems, type Items } from '../lib/model';
 import type { Item } from '../lib/types';
+import { mdActionCount } from '../lib/md';
 import { AskDelete } from './Dialogs';
 import { MsgBox } from './Messages';
-import { A, Badge, DecideBadge, Det, Dl, Empty, Fold, GROUP, GroupChk, ListBox, Md, Muted, RefBtn, RelBtn, SelectRow, StatusBadge } from './ui';
+import { A, Badge, DecideBadge, Det, Dl, Empty, Fold, GROUP, GroupChk, ListBox, Md, MdFold, Muted, RefBtn, RelBtn, SelectRow, StatusBadge } from './ui';
 
 // 목록 한 행. head가 있으면 기본 머리(번호·상태) 대신 쓴다(요청함 메시지 행)
 export function Card({ x, head, title, lead, leadCls, children }: {
@@ -42,26 +43,26 @@ export function PrLinks({ nums }: { nums?: (number | string)[] }) {
 }
 
 // 값이 없으면 null이라 Dl이 그 행을 생략한다
-const md = (t?: string) => t ? <Md text={t} /> : null;
 function Detail({ x }: { x: Item }) {
-  const { snap } = useApp(), r = x.raw;
-  if (x.kind === 'work') return <Det k={'d:' + x.id} summary="검증 · 남은 일 · PR">
-    <Dl rows={[['결론', md(r.conclusion)], ['검증', md(r.verification)], ['남은 일', md(r.remaining)],
+  const { snap, filters } = useApp(), r = x.raw, force = !!filters.q?.trim();
+  const md = (field: string) => r[field] ? <Md text={r[field]} foldKey={x.id + ':' + field} /> : null;
+  if (x.kind === 'work') return <Det force={force} k={'d:' + x.id} summary="검증 · 남은 일 · PR" actionCount={mdActionCount(r.conclusion, r.remaining)}>
+    <Dl rows={[['결론', md('conclusion')], ['검증', r.verification ? <MdFold k={x.id + ':verification'} summary="검증"><Md text={r.verification} /></MdFold> : null], ['남은 일', md('remaining')],
       ['PR', (r.prs || []).length ? <div class="flex flex-wrap gap-x-4 gap-y-1"><PrLinks nums={r.prs} /></div> : null]]} /></Det>;
   if (x.kind === 'question') {
     const ev = (r.evidence || []).length ? r.evidence.map((e: any, i: number) => <>{i ? ', ' : ''}<A label={e.label} url={e.url} /></>) : null;
     const hist = (r.history || []).length ? <ul class="list-disc pl-4">{r.history.map((h: any) => <li>{`${fmt(h.at)} ${h.change} (이유: ${h.reason})`}</li>)}</ul> : null;
-    return <Det k={'d:' + x.id} summary={`답변 전체${hist ? ` · 변경 이력 ${r.history.length}건` : ''}`}>
-      <Dl rows={[['답변', md(r.answer)], ['근거', ev], ['갱신', fmt(r.updatedAt)], ['변경 이력', hist]]} /></Det>;
+    return <Det force={force} k={'d:' + x.id} summary={`답변 전체${hist ? ` · 변경 이력 ${r.history.length}건` : ''}`} actionCount={mdActionCount(r.answer)}>
+      <Dl rows={[['답변', md('answer')], ['근거', ev], ['갱신', fmt(r.updatedAt)], ['변경 이력', hist]]} /></Det>;
   }
   if (x.kind === 'pr') {
     const works = (snap.data.work || []).filter(w => (w.prs || []).map(String).includes(String(r.number))).map(w => w.title).join(', ');
-    return <Det k={'d:' + x.id} summary="관찰 시각 · 관련 작업"><Dl rows={[['링크', <A label={r.url || ''} url={r.url} />], ['관련 작업', works],
+    return <Det force={force} k={'d:' + x.id} summary="관찰 시각 · 관련 작업"><Dl rows={[['링크', <A label={r.url || ''} url={r.url} />], ['관련 작업', works],
       ['merge 시각', r.mergedAt ? fmt(r.mergedAt) : null], ['GitHub 갱신', fmt(r.updatedAt)],
       ['관찰', r.ok === false ? `조회 실패 ${fmt(r.failedAt)} · 마지막 관찰 ${fmt(r.observedAt)}` : fmt(r.observedAt)]]} /></Det>;
   }
-  if (x.resolved) return <Det k={'d:' + x.id} summary="자세히"><Dl rows={[['내용', md(r.detail)], ['결정', r.status], ['결정 시각', r.resolvedAt ? fmt(r.resolvedAt) : null], ['출처', r.decisionSource]]} /></Det>;
-  return <Det k={'d:' + x.id} summary="자세히"><Dl rows={[['내용', md(r.detail)], ['대기 범위', md(r.waiting)]]} />
+  if (x.resolved) return <Det force={force} k={'d:' + x.id} summary="자세히" actionCount={mdActionCount(r.detail)}><Dl rows={[['내용', md('detail')], ['결정', r.status], ['결정 시각', r.resolvedAt ? fmt(r.resolvedAt) : null], ['출처', r.decisionSource]]} /></Det>;
+  return <Det force={force} k={'d:' + x.id} summary="자세히" actionCount={mdActionCount(r.detail, r.waiting)}><Dl rows={[['내용', md('detail')], ['대기 범위', md('waiting')]]} />
     <Muted cls="mt-2">이 항목을 진행판에서 숨겨도 결정이나 승인으로 간주하지 않습니다.</Muted></Det>;
 }
 // 원본(derivedFrom)과, 이 항목을 원본으로 적은 파생 항목으로 오가는 버튼. 역방향은 저장하지 않고 응답에서 계산하며, 숨긴 파생 항목은 나오지 않는다(결정 완료는 서버가 걸러 주지 않아 여기서 뺀다)

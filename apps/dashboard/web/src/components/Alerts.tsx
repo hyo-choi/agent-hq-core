@@ -112,6 +112,10 @@ export function useAlertRows() {
 // 항목을 강조한다. 접힌 묶음은 펼친다(onToggle이 펼침 상태를 기억)
 export function flash(t: Element) {
   for (let d = t.closest('details'); d; d = d.parentElement!.closest('details')) d.open = true;
+  for (const d of t.querySelectorAll<HTMLDetailsElement>('details[data-md-fold]')) {
+    d.open = true;
+    for (let parent = d.parentElement?.closest('details'); parent; parent = parent.parentElement?.closest('details')) parent.open = true;
+  }
   t.scrollIntoView({ block: 'center', behavior: 'smooth' });
   t.classList.add('ring-2', 'ring-primary', 'ring-inset');
   setTimeout(() => t.classList.remove('ring-2', 'ring-primary', 'ring-inset'), 2500);
