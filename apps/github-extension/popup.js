@@ -1,7 +1,9 @@
 import * as L from "./lib.js";
 import { ImageDraft } from "./images.js";
+import { imageHelp } from "./help.js";
 
 const $ = (id) => document.getElementById(id);
+imageHelp($("attachHelp"), $("attachHint"));
 const say = (text, err = false) => {
   $("status").textContent = text;
   $("status").className = err ? "err" : "";
