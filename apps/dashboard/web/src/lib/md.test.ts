@@ -38,6 +38,34 @@ describe('mdHtml', () => {
     expect(d.querySelector('p')!.querySelectorAll('br').length).toBe(1);
     expect(d.querySelector('a')!.getAttribute('href')).toBe('https://github.com/example/repo/pull/1234');
   });
+  it('구분선 열 수가 헤더와 달라도 표로 그리고 셀 인라인 Markdown과 정렬을 유지한다', () => {
+    const fewer = dom('| ID | 질문 | 상태 | 추천 | 영향 |\n| --- | :-: | --- | --- |\n| **D2** | `코드` | [PR](https://example.com/1) | *강조* | 끝 |');
+    expect(fewer.querySelectorAll('th').length).toBe(5);
+    expect(fewer.querySelectorAll('tbody td').length).toBe(5);
+    expect(fewer.querySelectorAll('th')[1].getAttribute('style')).toContain('center');
+    expect(fewer.querySelector('td strong')!.textContent).toBe('D2');
+    expect(fewer.querySelector('td code')!.textContent).toBe('코드');
+    expect(fewer.querySelector('td a')!.getAttribute('href')).toBe('https://example.com/1');
+    expect(fewer.querySelector('td em')!.textContent).toBe('강조');
+    expect(fewer.querySelector('p')).toBeNull();
+    const more = dom('a | b\n--|--|--\n1 | 2');
+    expect([...more.querySelectorAll('th')].map(x => x.textContent)).toEqual(['a', 'b']);
+    expect(dom('| a\\|b | c |\n| --- |\n| 1 | 2 |').querySelectorAll('th').length).toBe(2);
+    expect(mdPlain('| A | B |\n| --- |\n| 1 | 2 |')).toBe('A B 1 2');
+  });
+  it('긴 글 셀에만 최소 폭 class를 붙인다', () => {
+    const d = dom(`| a | b |\n| --- | --- |\n| 짧음 | ${'긴 글 '.repeat(20)} |`);
+    expect([...d.querySelectorAll('td')].map(x => x.classList.contains('md-long'))).toEqual([false, true]);
+  });
+  it('표가 아닌 구분선·코드 블록의 파이프는 바꾸지 않는다', () => {
+    const fenced = '```\n| a | b |\n| --- |\n```';
+    expect(dom(fenced).querySelector('table')).toBeNull();
+    expect(dom(fenced).querySelector('pre')!.textContent).toBe('| a | b |\n| --- |\n');
+    expect(dom('~~~~\n```\n| a | b |\n| --- |\n~~~~').querySelector('table')).toBeNull();
+    expect(dom('제목\n---').querySelector('h2')!.textContent).toBe('제목');
+    expect(dom('글자 a | b\n\n---').querySelector('hr')).toBeTruthy();
+    expect(dom('    | a | b |\n    | --- |').querySelector('pre, table')!.tagName).toBe('PRE');
+  });
   it('요약용 plain text는 Markdown 기호를 빼고 글자만 남긴다', () => {
     expect(mdPlain('#### 배경\n**추천** `A`\n\n| 선택지 | 영향 |\n| --- | --- |\n| A | 빠름 |\n\n```\ncode\n```')).toBe('배경 추천 A 선택지 영향 A 빠름');
     expect(mdPlain('plain 기록\n둘째 줄')).toBe('plain 기록 둘째 줄');

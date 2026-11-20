@@ -496,7 +496,7 @@ class T(unittest.TestCase):
         self.assertEqual(self.ids(), before)
         self.assertEqual(rd(self.data)["globalLimitsId"], lid)
 
-    def test_nonstandard_existing_id_hq86(self):
+    def test_nonstandard_existing_id_preserved(self):
         # q-legacy01처럼 사람이 직접 넣은 8hex가 아닌 id: 보존·번호·삭제·메시지가 모두 같은 인덱스를 따른다
         raw = rd(self.data); raw["questions"].append({"id": "q-legacy01", "q": "형식 밖 질문?", "status": "열림"}); wr(self.data, raw)
         self.assertEqual(self.cli("migrate-ids")["added"], 0)
@@ -1207,7 +1207,8 @@ class T(unittest.TestCase):
     def test_summary_markdown_hidden_and_legacy(self):
         self.get("/api/dashboard")
         ids = self.ids(); w0, w1 = ids["work"]  # A: 진행 중(legacy), B: 완료(legacy 문구)
-        n = self.item("add", "work", "--set", "title=숨긴 미완료 /Users/me/x run_123abc", "--set", "status=진행 중", "--set", "remaining=DEMO-42 확인")
+        local_path = os.path.join(os.sep, "Users", "fixture", "project")
+        n = self.item("add", "work", "--set", f"title=숨긴 미완료 {local_path} run_000abc", "--set", "status=진행 중", "--set", "remaining=DEMO-42 확인")
         closed = self.item("add", "work", "--set", "title=끝난 일", "--set", "status=진행 중")
         self.item("set", closed["id"], "--set", "state=closed", "--reason", "사용자 종료")
         self.post(self.req(("work", n["id"]))); self.cli("process-inbox")
@@ -1226,7 +1227,7 @@ class T(unittest.TestCase):
         self.assertEqual([x["id"] for x in self.cli("summary")["legacyDoneByStatus"]], [w1, ids["question"]])
         self.assertIn(f"- {refs[w0]} [작업] 합성 작업 A", md)  # legacy 미완료는 그대로
         self.assertIn(f"- {refs[ids['decision']]} [결정] 합성 결정", md)
-        for leak in ("비밀 메시지 원문", "/Users/me", "run_123abc"):
+        for leak in ("비밀 메시지 원문", local_path, "run_000abc"):
             self.assertNotIn(leak, md)
         active = md.split("## 진행 중")[1].split("##")[0]
         order = [l.split()[1] for l in active.splitlines() if l.startswith("- HQ-")]

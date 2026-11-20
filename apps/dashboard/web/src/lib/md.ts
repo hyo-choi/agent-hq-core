@@ -14,6 +14,28 @@ md.renderer.rules.link_open = (tokens, i, opts, _env, self) => {
   tokens[i].attrJoin('class', 'link link-info');
   return self.renderToken(tokens, i, opts);
 };
+// 긴 글 셀만 최소 폭을 줘(.md-long) 좁은 화면에서 한 열이 세로로 길어지지 않게 한다. 폭은 CSS로 정하고 표는 자기 안에서 스크롤한다
+md.renderer.rules.td_open = (tokens, i, opts, _env, self) => {
+  if (tokens[i + 1].content.length > 40) tokens[i].attrJoin('class', 'md-long');
+  return self.renderToken(tokens, i, opts);
+};
+// GFM은 헤더와 구분선의 열 수가 다르면 표로 보지 않아 파이프가 글자로 노출된다. 작성 실수의 의도가 분명하므로 구분선만 헤더 열 수에 맞춘다(본문 행의 넘침·부족은 parser가 처리)
+const DELIM = /^ {0,3}\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+const cellsOf = (row: string) => row.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '').split(/(?<!\\)\|/).map(c => c.trim());
+const fixTableDelims = (src: string) => {
+  let fence = '';
+  return src.split('\n').map((line, i, lines) => {
+    const f = line.match(/^ {0,3}(`{3,}|~{3,})/)?.[1];
+    if (f && !fence) fence = f;
+    else if (f && f[0] === fence[0] && f.length >= fence.length) fence = '';
+    const head = lines[i - 1];
+    if (fence || f || !head || !line.includes('|') || !DELIM.test(line) || /^ {4}/.test(head) || !/(?<!\\)\|/.test(head) || DELIM.test(head)) return line;
+    const want = cellsOf(head).length, have = cellsOf(line);
+    if (want === have.length) return line;
+    return '| ' + Array.from({ length: want }, (_, k) => have[k] ?? '---').join(' | ') + ' |';
+  }).join('\n');
+};
+md.core.ruler.after('normalize', 'fix_table_delims', state => { state.src = fixTableDelims(state.src); });
 export const mdHtml = (text: string) => md.render(text);
 // 카드 요약·알림용 plain text. 같은 parser의 inline 토큰에서 글자만 모아 `##`·`**`·표 구분선 같은 기호를 숨긴다(HTML 없음, 코드 블록 제외)
 export const mdPlain = (text?: string | null) => text ? md.parse(text, {}).filter(t => t.type === 'inline')
