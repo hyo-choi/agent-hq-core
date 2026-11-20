@@ -1529,6 +1529,51 @@ s.Handler.log_message = log
         self.assertEqual((code, r["duplicate"], r["flush"]["status"]), (201, False, "queued"))
         self.assertNotEqual(r["flush"]["flushId"], first["flushId"])
 
+    def test_flush_same_second_generations_and_legacy_registration(self):
+        fixed = "2001-02-03T04:05:06Z"
+        code = f"s.now = lambda: {fixed!r}"
+        self.stop(); self.start(code=code)
+
+        def register():
+            args = ["flush", "register", "--provider", "codex", "--thread", THREAD, "--evidence", "synthetic session"]
+            result = subprocess.run([sys.executable, "-c", "import server as s\n" + code + "\ns.main()", *args],
+                                    env=self.env, cwd=HERE, capture_output=True, text=True, check=True)
+            self.assertNotIn("generation", result.stdout)
+            return json.loads(result.stdout)
+
+        path = os.path.join(self.root, "private", "flush.json")
+        register()
+        first_generation = rd(path)["registration"]["generation"]
+        self.assertRegex(first_generation, r"^[0-9a-f]{32}$")
+        first = self.flush()[1]["flush"]
+        self.assertTrue(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
+        register()  # 시각과 thread가 같아도 새 등록이다. cooldown은 과거 고정 시각으로 분리한다.
+        box = rd(path)
+        self.assertEqual(box["registration"]["registeredAt"], first["createdAt"])
+        self.assertNotEqual(box["registration"]["generation"], first_generation)
+        self.assertFalse(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
+        status, second = self.flush()
+        self.assertEqual((status, second["duplicate"], second["flush"]["status"]), (201, False, "queued"))
+        self.assertNotEqual(second["flush"]["flushId"], first["flushId"])
+        self.assertEqual(len(self.codex_calls()), 2)
+        self.assertEqual(self.flush()[1]["flush"]["flushId"], second["flush"]["flushId"])
+        self.assertEqual(self.flush(first["flushId"])[1]["flush"]["flushId"], first["flushId"])  # 응답 유실 재시도 보존
+        public = self.get("/api/dashboard")[1]["flush"]
+        self.assertEqual([f["active"] for f in public["recent"]], [False, True])
+        for value in (second, public, self.cli("flush", "status")):
+            self.assertNotIn("generation", json.dumps(value))
+            self.assertNotIn(first_generation, json.dumps(value))
+
+        # 기존 등록/flush에는 세대 키가 없다. 이전 중복 억제를 유지하고 다음 등록에서 분리한다.
+        box = rd(path); box["registration"].pop("generation"); box["flushes"] = [box["flushes"][-1]]
+        box["flushes"][0].pop("generation"); wr(path, box)
+        self.assertTrue(self.get("/api/dashboard")[1]["flush"]["recent"][0]["active"])
+        self.assertEqual(self.flush()[1]["flush"]["flushId"], second["flush"]["flushId"])
+        register()
+        self.assertFalse(self.get("/api/dashboard")[1]["flush"]["recent"][0]["active"])
+        self.assertEqual(self.flush()[0], 201)
+        self.assertEqual(len(self.codex_calls()), 3)
+
     def test_flush_self_ambiguous_env_and_explicit_provider(self):
         sock, _ = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
         both = {**self.self_env(sid, sock), "CODEX_THREAD_ID": THREAD}

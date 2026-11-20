@@ -954,7 +954,12 @@ DELIVER = {"codex": deliver_codex, "claude": deliver_claude}
 
 
 def flush_is_open(f, reg):
-    return bool(reg and f["status"] in ("sending", "queued") and f["thread"] == reg["thread"] and f["createdAt"] >= reg["registeredAt"])
+    if not reg or f["status"] not in ("sending", "queued") or f["thread"] != reg["thread"]:
+        return False
+    if reg.get("generation"):
+        return f.get("generation") == reg["generation"]
+    # 이전 버전의 등록은 기존 대기 요청을 보존한다. 다음 명시 등록부터 임의 세대 ID로 구분한다.
+    return not f.get("generation") and f["createdAt"] >= reg["registeredAt"]
 
 
 def accept_flush(body):
@@ -975,6 +980,7 @@ def accept_flush(body):
         if box["flushes"] and (wait := FLUSH_COOLDOWN - age_sec(box["flushes"][-1]["createdAt"])) > 0:
             raise BadRequest(429, f"{int(wait) + 1}초 후에 다시 요청할 수 있습니다")
         f = {"flushId": fid, "createdAt": now(), "provider": reg and reg["provider"], "thread": reg and reg["thread"],
+             "generation": reg and reg.get("generation"),
              "threadName": reg and reg["threadName"], "status": "sending" if reg else "not_registered",
              "error": None if reg else "등록된 coordinator thread가 없습니다", "queueMessageId": None, "sentAt": None,
              "processedAt": None, "processNote": None}
@@ -994,7 +1000,7 @@ def accept_flush(body):
 def flush_public(box):
     reg = box["registration"]
     return {"registration": reg and {k: reg[k] for k in ("provider", "threadName", "registeredAt")},
-            "recent": [{**{k: v for k, v in f.items() if k not in ("thread", "queueMessageId")},
+            "recent": [{**{k: v for k, v in f.items() if k not in ("thread", "queueMessageId", "generation")},
                         "active": flush_is_open(f, reg)} for f in box["flushes"][-5:]],
             "cooldownSec": FLUSH_COOLDOWN}
 
@@ -1048,6 +1054,7 @@ def flush_cli(a):
                 sys.exit("--evidence가 필요합니다")
             prev = box["registration"]
             box["registration"] = {"provider": provider, "thread": thread, "threadName": name, "registeredAt": now(),
+                                   "generation": secrets.token_hex(16),
                                    "evidence": a.evidence or "세션 자기 등록(--self)", **extra,
                                    "previous": prev and {"provider": prev["provider"], "thread": prev["thread"]}}
             changed = True
@@ -1062,7 +1069,8 @@ def flush_cli(a):
         if changed:
             write_json(FLUSH, box)
     reg = box["registration"]  # 출력에는 Claude 세션 토큰·socket 경로를 내보내지 않는다
-    return {"registration": reg and {k: v for k, v in reg.items() if k != "claude"}, "flushes": box["flushes"][-10:]}
+    return {"registration": reg and {k: v for k, v in reg.items() if k not in ("claude", "generation")},
+            "flushes": [{k: v for k, v in f.items() if k != "generation"} for f in box["flushes"][-10:]]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1222,7 +1230,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.upload_slots.release()
         key = "upload" if is_upload else {accept_request: "request", accept_message: "message", accept_flush: "flush"}[accept]
         if accept is accept_flush:  # 등록 세션 id와 queue 내부 id는 응답에 넣지 않는다
-            req = {k: v for k, v in req.items() if k not in ("thread", "queueMessageId")}
+            req = {k: v for k, v in req.items() if k not in ("thread", "queueMessageId", "generation")}
         if accept is accept_message:
             req = public_message(req)
         self.send_body(200 if dup else 201, {key: req, "duplicate": dup})
