@@ -3,7 +3,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useApp } from '../ctx';
 import { markSeen, newBox } from '../lib/alerts';
-import { post } from '../lib/api';
+import { post, uploadImage } from '../lib/api';
 import { KIND, MSG_KINDS, MSG_MAX, MSG_ST, fmt, msgName, msgTarget, newId, oneLine, resolvedItems, tgtName } from '../lib/model';
 import { loadDrafts, setDraft } from '../lib/storage';
 import type { Item, Kind, Msg, MsgLink } from '../lib/types';
@@ -16,8 +16,12 @@ const subs = new Set<() => void>();
 const ping = () => subs.forEach(f => f());
 function useShared() {
   const [, rerender] = useState(0);
-  useEffect(() => { const f = () => rerender(n => n + 1); subs.add(f); return () => { subs.delete(f); }; }, []);
+  useLayoutEffect(() => { const f = () => rerender(n => n + 1); subs.add(f); return () => { subs.delete(f); }; }, []);
 }
+type PendingImage = { file: File; url: string; key: string; id?: string };
+const images: Record<string, PendingImage[]> = {};
+const imageMids: Record<string, string | null> = {};
+const IMAGE_MAX = 5 * 1024 * 1024, IMAGE_COUNT = 6;
 const sendSt: Record<string, { busy: boolean; err: string; failed: boolean }> = {};
 
 // 항목 메시지와 자유 메시지(kind general, itemId 없음)가 같은 입력·전송·초안·재시도 흐름을 쓴다. dkey는 초안 키다.
@@ -25,7 +29,8 @@ const sendSt: Record<string, { busy: boolean; err: string; failed: boolean }> = 
 export function Composer({ dkey, kind, itemId, ariaLabel, placeholder, rows = 3 }: {
   dkey: string; kind: string; itemId: string | null; ariaLabel: string; placeholder: string; rows?: number }) {
   const { toast, reload, setEditing } = useApp();
-  const ta = useRef<HTMLTextAreaElement>(null);
+  const ta = useRef<HTMLTextAreaElement>(null), picker = useRef<HTMLInputElement>(null);
+  const attached = images[dkey] ||= [];
   const [text, setText] = useState(() => loadDrafts()[dkey]?.text || '');
   useShared();
   const st = sendSt[dkey] ||= { busy: false, err: '', failed: false }, { busy, err, failed } = st;
@@ -49,16 +54,42 @@ export function Composer({ dkey, kind, itemId, ariaLabel, placeholder, rows = 3 
     return () => { removeEventListener('pointerup', up, true); removeEventListener('pointercancel', up, true); setEditing(cur => cur === dkey ? null : cur); };
   }, []);
   // 내용을 고치면 messageId를 새로 받는다. 같은 번호로 다른 글을 보내 충돌(409)하지 않게 하기 위해서다
-  const onInput = (v: string) => { setText(v); setDraft(dkey, v ? { text: v, mid: null } : null); ping(); };
+  const newMessage = () => {
+    // 응답 유실 뒤 편집하면 기존 첨부가 이미 접수됐을 수 있다. 보존한 File로 새 연결을 만든다.
+    if (imageMids[dkey]) attached.forEach(a => { a.key = newId(); delete a.id; });
+    imageMids[dkey] = null;
+  };
+  const onInput = (v: string) => { newMessage(); setText(v); setDraft(dkey, v ? { text: v, mid: null } : null); ping(); };
+  const changedImages = () => { newMessage(); setDraft(dkey, { text: ta.current?.value || '', mid: null }); ping(); };
+  const addImages = (files: File[]) => {
+    if (st.busy) return;
+    const errors: string[] = [], before = attached.length;
+    for (const file of files) {
+      if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) { errors.push(`${file.name}: PNG, JPEG, WebP만 첨부할 수 있습니다.`); continue; }
+      if (!file.size || file.size > IMAGE_MAX) { errors.push(`${file.name}: 한 장은 5MiB 이하여야 합니다.`); continue; }
+      if (attached.length >= IMAGE_COUNT) { errors.push(`${file.name}: 이미지는 최대 6장까지 첨부할 수 있습니다.`); continue; }
+      attached.push({ file, key: newId(), url: URL.createObjectURL(file) });
+    }
+    if (attached.length !== before) changedImages();
+    upd({ err: errors.join(' ') });
+  };
+  const removeImage = (i: number) => { URL.revokeObjectURL(attached[i].url); attached.splice(i, 1); changedImages(); };
   const send = async () => {
     const v = ta.current!.value;
-    if (!v.trim() || st.busy) return;
-    const mid = loadDrafts()[dkey]?.mid || newId();  // 실패 뒤 그대로 다시 보내면 같은 번호라 서버가 한 번만 접수한다
-    setDraft(dkey, { text: v, mid });
+    if ((!v.trim() && !attached.length) || st.busy) return;
+    const mid = (attached.length ? imageMids[dkey] : loadDrafts()[dkey]?.mid) || newId();  // 실패 뒤 그대로 다시 보내면 같은 번호라 서버가 한 번만 접수한다
+    imageMids[dkey] = mid;
+    setDraft(dkey, { text: v, mid: attached.length ? null : mid });
     upd({ busy: true, err: '' }); sending.current = true;
     const s = newBox.get(); if (s) newBox.put(markSeen(s, 'm:' + mid));  // 내가 보낸 메시지는 새 항목 알림에서 뺀다(보내기 전에 표시해 동시 갱신과 경쟁하지 않는다)
     try {
-      const body = await post('api/messages', itemId ? { messageId: mid, kind, itemId, text: v } : { messageId: mid, kind, text: v }, 'message');
+      for (const image of attached) {
+        if (!image.id) image.id = (await uploadImage(image.file, image.key)).id;
+      }
+      const payload = { messageId: mid, kind, ...(itemId ? { itemId } : {}), text: v,
+        ...(attached.length ? { attachments: attached.map(a => a.id!) } : {}) };
+      const body = await post('api/messages', payload, 'message');
+      attached.forEach(a => URL.revokeObjectURL(a.url)); attached.splice(0); imageMids[dkey] = null;
       setDraft(dkey, null); if (ta.current) ta.current.value = ''; setText('');
       toast(body.duplicate ? '이미 접수된 메시지입니다.' : `${msgName(kind)}을 접수했습니다. 담당 에이전트가 확인하면 여기에 답변이 표시됩니다.`);
       upd({ busy: false, failed: false }); await reload();
@@ -69,17 +100,37 @@ export function Composer({ dkey, kind, itemId, ariaLabel, placeholder, rows = 3 
       sending.current = false; release();
     }
   };
-  return <div ref={wrap} onFocusIn={() => setEditing(dkey)} onPointerDown={() => { pressing.current = true; }}
+  return <div ref={wrap} onPaste={e => {
+    const files = Array.from(e.clipboardData?.files || []);
+    if (files.length) { e.preventDefault(); addImages(files); }
+  }} onDragOver={e => { if (e.dataTransfer?.types.includes('Files')) e.preventDefault(); }}
+    onDrop={e => { if (e.dataTransfer?.files.length) { e.preventDefault(); addImages(Array.from(e.dataTransfer.files)); } }} onFocusIn={() => setEditing(dkey)} onPointerDown={() => { pressing.current = true; }}
     onFocusOut={e => { if (!wrap.current?.contains(e.relatedTarget as Node)) release(); }}>
     {/* 보내는 중에는 모든 진입점의 같은 키 입력칸을 읽기 전용으로 둔다. 성공하면 초안을 지우므로 그 사이 고친 글이 조용히 사라지지 않게 한다 */}
     <textarea ref={ta} class="textarea w-full text-sm" rows={rows} maxLength={MSG_MAX} aria-label={ariaLabel} placeholder={placeholder}
       readOnly={busy} defaultValue={text} onInput={e => onInput(e.currentTarget.value)} />
+    <div class="mt-2 flex flex-wrap gap-2">{attached.map((a, i) => <div key={a.key} class="grid w-24 gap-1">
+      <img src={a.url} alt={`첨부 미리보기 ${i + 1}`} class="h-20 w-24 rounded object-contain" />
+      <span class="truncate text-xs">{a.file.name}</span>
+      <button type="button" class="btn btn-xs" disabled={busy} onClick={() => removeImage(i)} aria-label={`첨부 ${i + 1} 제거`}>제거</button>
+    </div>)}</div>
+    <input ref={picker} type="file" accept="image/png,image/jpeg,image/webp" multiple class="hidden" aria-label={`${ariaLabel} 이미지 파일 선택`}
+      disabled={busy} onChange={e => { addImages(Array.from(e.currentTarget.files || [])); e.currentTarget.value = ''; }} />
+    <button class="btn btn-sm mt-2" type="button" disabled={busy} onClick={() => picker.current?.click()}>이미지 첨부</button>
+    <Muted cls="mt-1 text-xs">붙여 넣기·끌어다 놓기·파일 선택 · PNG/JPEG/WebP · 장당 5MiB, 최대 6장. 이미지 초안은 새로고침하면 사라집니다. 전송된 이미지는 14일 뒤 삭제됩니다.</Muted>
     <div class="mt-2 flex flex-wrap items-center justify-between gap-2">
       <span class="text-xs tabular-nums text-base-content/60">{text.trim().length}/{MSG_MAX}</span>
-      <button class="btn btn-sm btn-primary" type="button" disabled={busy || !text.trim()} onClick={send}>{busy ? '보내는 중…' : failed ? '다시 보내기' : '보내기'}</button>
+      <button class="btn btn-sm btn-primary" type="button" disabled={busy || (!text.trim() && !attached.length)} onClick={send}>{busy ? '보내는 중…' : failed ? '다시 보내기' : '보내기'}</button>
     </div>
     <div aria-live="assertive">{err ? <ErrAlert>{err}</ErrAlert> : null}</div>
   </div>;
+}
+
+function Attachments({ m }: { m: Msg }) {
+  return m.attachments?.length ? <div class="flex flex-wrap gap-2" aria-label="메시지 첨부 이미지">{m.attachments.map((a, i) =>
+    a.available ? <a key={a.id} href={`api/uploads/${a.id}`} target="_blank" rel="noopener noreferrer" title={`첨부 이미지 ${i + 1} 원본 열기`}>
+      <img src={`api/uploads/${a.id}`} alt={`첨부 이미지 ${i + 1}`} class="h-24 w-28 rounded border border-base-300 object-contain" /></a>
+      : <Muted key={a.id} cls="text-xs">첨부 이미지 {i + 1}: 보관 기간이 지나 삭제됨</Muted>)}</div> : null;
 }
 
 export const msgLabel = (m: Msg) => `${msgName(m.kind)} ${oneLine(m.text).slice(0, 40)}`;
@@ -97,6 +148,7 @@ function MsgItem({ m }: { m: Msg }) {
     <div class="flex flex-wrap items-center gap-1.5 text-xs text-base-content/60"><Badge cls={(MSG_ST[m.status] || [m.status])[1]}>{(MSG_ST[m.status] || [m.status])[0]}</Badge>
       {`${msgName(m.kind)} · ${fmt(m.createdAt)}${m.processedAt ? ' · 처리 ' + fmt(m.processedAt) : ''}`}</div>
     <Md text={m.text} />
+    <Attachments m={m} />
     {m.link ? <Muted cls="break-words text-xs">{`담당 에이전트가 ${refOf(t!.id) || ''} ${tgtName(t!)}에 분류했습니다(${fmt(m.link.at)}${m.link.note ? ', ' + m.link.note : ''}). 원래 출처: ${src}`}</Muted> : null}
     {m.processNote ? <Muted cls="whitespace-pre-wrap break-words">{'처리 메모: ' + m.processNote}</Muted> : null}
     {(m.replies || []).map(r => <div class="border-l-2 border-base-300 pl-3"><p class="text-xs font-medium text-base-content/60">에이전트 답변 · {fmt(r.at)}</p>
@@ -112,7 +164,7 @@ function MsgFold({ m }: { m: Msg }) {
     <summary class="flex cursor-pointer flex-wrap items-center gap-1.5 px-3 py-2 text-sm"><MsgRef m={m} /><StBadge m={m} /><Badge>{msgName(m.kind)}</Badge>
       {m.link && m.kind === 'general' ? <Badge cls="badge-primary">분류됨</Badge> : null}{n ? <Badge>답변 {n}</Badge> : null}
       <span class="text-xs text-base-content/60">{fmt(m.createdAt)}</span>
-      <span class="min-w-0 basis-full truncate text-base-content/80 group-open/mx:hidden">{oneLine(m.text)}</span></summary>
+      <span class="min-w-0 basis-full truncate text-base-content/80 group-open/mx:hidden">{oneLine(m.text) || (m.attachments?.length ? `이미지 ${m.attachments.length}장` : '')}</span></summary>
     <ul class="grid px-2 pb-2"><MsgItem m={m} /></ul>
   </details>;
 }
@@ -134,7 +186,7 @@ export function MsgBox({ x }: { x: Item }) {
 }
 function MsgRow({ x }: { x: Item }) {
   const m: Msg = x.raw, t = msgTarget(m), n = (m.replies || []).length;
-  return <Card x={x} title={t ? tgtName(t) : '연결 항목 없음'} lead={oneLine(m.text)} leadCls="line-clamp-1 break-all"
+  return <Card x={x} title={t ? tgtName(t) : '연결 항목 없음'} lead={oneLine(m.text) || (m.attachments?.length ? `이미지 ${m.attachments.length}장` : '')} leadCls="line-clamp-1 break-all"
     head={<><MsgRef m={m} /><Badge>{msgName(m.kind)}</Badge>{m.link && m.kind === 'general' ? <Badge cls="badge-primary">분류됨</Badge> : null}<LinkRef t={t} />
       <StBadge m={m} />{n ? <Badge>답변 {n}</Badge> : null}<span class="text-xs text-base-content/60">{fmt(m.createdAt)}</span></>}>
     <Det k={'mx:' + m.messageId} summary={`원문${n ? ' · 답변 ' + n : ''}${m.processedAt ? ' · 처리 기록' : ''} 보기`}><ul class="grid"><MsgItem m={m} /></ul></Det>

@@ -32,6 +32,92 @@ const refresh = () => act(async () => { document.dispatchEvent(new Event('visibi
 const tabBtn = (name: string) => screen.getAllByRole('tab').find(b => b.textContent!.startsWith(name))!;
 
 describe('App', () => {
+  it('이미지 선택·붙여 넣기·드롭·제거와 한도를 적용하고 이미지 전송을 같은 번호로 재시도한다', async () => {
+    sessionStorage.setItem('tab', '"requests"');
+    // 독립 초안 키로 기존 텍스트 재시도 테스트와 전송 상태를 공유하지 않는다.
+    snap.data.work = [{ id: 'w-images', title: '이미지 테스트', status: '진행 중' }];
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["m:w-images"]');
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const original = (fetch as any).getMockImplementation(), uploads: any[] = [];
+    (fetch as any).mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === 'api/uploads') { uploads.push(init); return new Response(JSON.stringify({ upload: { id: 'a'.repeat(32) } }), { status: 201 }); }
+      return original(url, init);
+    });
+    render(<App />);
+    const ta = await screen.findByLabelText('후속 질문: 이미지 테스트');
+    const wrap = ta.parentElement!, picker = wrap.querySelector('input[type=file]')!;
+    const png = () => new File(['png'], 'sample.png', { type: 'image/png' });
+    fireEvent.change(picker, { target: { files: [png()] } });
+    expect(await screen.findByAltText('첨부 미리보기 1')).toBeTruthy();
+    fireEvent.paste(ta, { clipboardData: { files: [png()] } });
+    fireEvent.drop(wrap, { dataTransfer: { files: [png()] } });
+    expect(screen.getAllByAltText(/첨부 미리보기/)).toHaveLength(3);
+    fireEvent.click(screen.getByLabelText('첨부 2 제거'));
+    expect(screen.getAllByAltText(/첨부 미리보기/)).toHaveLength(2);
+    fireEvent.change(picker, { target: { files: [new File(['bad'], 'bad.svg', { type: 'image/svg+xml' }), new File([new Uint8Array(5 * 1024 * 1024 + 1)], 'big.png', { type: 'image/png' }), ...Array.from({ length: 5 }, png)] } });
+    expect(screen.getAllByAltText(/첨부 미리보기/)).toHaveLength(6);
+    expect(screen.getByText(/bad.svg: PNG/).textContent).toContain('최대 6장');
+    // 한 장만 남겨 전송 실패 후 업로드를 반복하지 않는지 확인한다.
+    for (let i = 6; i > 1; i--) fireEvent.click(screen.getByLabelText(`첨부 ${i} 제거`));
+    postFail = 1;
+    fireEvent.click([...wrap.querySelectorAll('button')].find(b => b.textContent === '보내기')!);
+    await screen.findByText(/보내지 못했습니다/);
+    fireEvent.click(screen.getByText('다시 보내기'));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(uploads).toHaveLength(1);
+    expect(posts[0][1].messageId).toBe(posts[1][1].messageId);
+    expect(posts[1][1]).toMatchObject({ text: '', attachments: ['a'.repeat(32)] });
+    await waitFor(() => expect(screen.queryByAltText('첨부 미리보기 1')).toBeNull());
+    vi.restoreAllMocks();
+  });
+
+  it('응답 유실 후 글을 고치면 보존한 File로 새 업로드와 새 메시지를 만든다', async () => {
+    snap.data.work = [{ id: 'w-edit-image', title: '첨부 수정', status: '진행 중' }];
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["m:w-edit-image"]');
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:edit'); vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const original = (fetch as any).getMockImplementation(), uploads: { key: string; file: unknown }[] = [], accepted: any[] = [];
+    (fetch as any).mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === 'api/uploads') {
+        uploads.push({ key: (init!.headers as Record<string, string>)['X-Upload-Key'], file: init!.body });
+        return new Response(JSON.stringify({ upload: { id: String(uploads.length).repeat(32) } }), { status: 201 });
+      }
+      if (url === 'api/messages') {
+        const body = JSON.parse(String(init!.body)); accepted.push(body);
+        if (accepted.length === 1) throw new Error('응답 유실');
+        if (accepted[0].attachments[0] === body.attachments[0]) return new Response(JSON.stringify({ error: '이미 연결됨' }), { status: 409 });
+      }
+      return original(url, init);
+    });
+    render(<App />);
+    const ta = await screen.findByLabelText('후속 질문: 첨부 수정') as HTMLTextAreaElement, wrap = ta.parentElement!;
+    const file = new File(['png'], 'edit.png', { type: 'image/png' });
+    fireEvent.change(wrap.querySelector('input[type=file]')!, { target: { files: [file] } });
+    fireEvent.input(ta, { target: { value: '원문' } });
+    fireEvent.click([...wrap.querySelectorAll('button')].find(b => b.textContent === '보내기')!);
+    await screen.findByText(/응답 유실/);
+    fireEvent.input(ta, { target: { value: '고친 글' } });
+    fireEvent.click(screen.getByText('다시 보내기'));
+    await waitFor(() => expect(accepted).toHaveLength(2));
+    expect(accepted[1].messageId).not.toBe(accepted[0].messageId);
+    expect(accepted[1].attachments).not.toEqual(accepted[0].attachments);
+    expect(uploads[1].key).not.toBe(uploads[0].key);
+    expect(uploads[1].file).toBe(uploads[0].file);
+    await waitFor(() => expect(ta.value).toBe(''));
+    vi.restoreAllMocks();
+  });
+
+  it('메시지 카드의 원본 이미지 링크와 만료 안내를 표시한다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["m:w-1","mx:images-card"]');
+    snap.messages = [{ messageId: 'images-card', kind: 'work', itemId: 'w-1', text: '', label: '작업 하나', status: 'received',
+      attachments: [{ id: 'a'.repeat(32), type: 'image/png', size: 3, available: true }, { id: 'b'.repeat(32), type: 'image/jpeg', size: 3, available: false }] }];
+    render(<App />);
+    const img = await screen.findByAltText('첨부 이미지 1');
+    expect(img.closest('a')?.getAttribute('href')).toBe('api/uploads/' + 'a'.repeat(32));
+    expect(img.closest('a')?.getAttribute('target')).toBe('_blank');
+    expect(screen.getByText(/보관 기간이 지나 삭제됨/)).toBeTruthy();
+  });
+
   it('질문 답변과 추천 본문에도 소제목 규칙을 적용하고 빈 검증은 생략한다', async () => {
     snap.data.questions = [{ id: 'q-fold', q: '질문 접기', status: '조사 중', answer: '### 알아 두실 점\n질문 정보\n\n### 필요한 결정\n질문 선택' }];
     snap.data.recommendations = { updatedAt: new Date().toISOString(), items: [{ id: 'rec-fold', title: '추천 접기', why: '### 배경\n추천 정보', action: '### 정해 주실 것\n추천 행동' }] };

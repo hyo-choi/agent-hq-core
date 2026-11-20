@@ -35,6 +35,7 @@ export interface ReqItem { kind: string; id: string; label: string }
 export interface Req { requestId: string; createdAt?: string; status: string; processedAt?: string; error?: string; items: ReqItem[] }
 export interface MsgLink { id: string; kind: string; label: string; at?: string; note?: string }
 export interface Msg {
+  attachments?: { id: string; type: string; size: number; available: boolean }[];
   messageId: string; kind: string; itemId: string | null; label: string | null; text: string; status: string;
   createdAt?: string; processedAt?: string; processNote?: string; link?: MsgLink | null; replies?: { at?: string; text: string }[];
 }

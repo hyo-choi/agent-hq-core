@@ -5,7 +5,7 @@ gh는 PATH 앞의 가짜 스크립트로 바꿔서 실제 GitHub을 조회하거
   python3 test_server.py
 """
 import hashlib, json, os, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, unittest
-import urllib.request, urllib.error
+import urllib.request, urllib.error, http.client
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = {
@@ -99,10 +99,11 @@ class T(unittest.TestCase):
         self.base = f"http://127.0.0.1:{self.port}"
         self.start()
 
-    def start(self):
-        self.proc = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py"), "serve", "--host", "127.0.0.1", "--port", str(self.port),
-                                      "--alias", ALIAS],
-                                     env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def start(self, *extra, code=None):
+        launch = [sys.executable, "-c", "import server as s\n" + code + "\ns.main()"] if code else [sys.executable, os.path.join(HERE, "server.py")]
+        self.proc = subprocess.Popen([*launch, "serve", "--host", "127.0.0.1", "--port", str(self.port),
+                                      "--alias", ALIAS, *extra],
+                                     env=self.env, cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(50):
             try:
                 urllib.request.urlopen(self.base + "/", timeout=1); return
@@ -140,6 +141,315 @@ class T(unittest.TestCase):
 
     def req(self, *items):
         return {"requestId": secrets.token_hex(16), "action": "hide_from_dashboard", "items": [{"kind": k, "id": i} for k, i in items]}
+
+    def upload(self, raw=b"\x89PNG\r\n\x1a\nfixture", key=None, origin=True, site="same-origin", size=None):
+        headers = {"Content-Type": "image/png", "X-Upload-Key": key or secrets.token_hex(16), "Sec-Fetch-Site": site}
+        if origin:
+            headers["Origin"] = self.base if origin is True else origin
+        if size is not None:
+            headers["Content-Length"] = str(size)
+        req = urllib.request.Request(self.base + "/api/uploads", data=raw, headers=headers)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_image_upload_message_retry_permissions_and_restore(self):
+        key = secrets.token_hex(16)
+        code, uploaded = self.upload(key=key)
+        self.assertEqual(code, 201)
+        uid = uploaded["upload"]["id"]
+        self.assertEqual(self.upload(key=key)[1]["upload"]["id"], uid)
+        self.assertEqual(self.upload(b"\x89PNG\r\n\x1a\nother", key=key)[0], 409)
+        body = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        self.assertEqual(self.post(body, path="/api/messages")[0], 201)
+        self.assertTrue(self.post(body, path="/api/messages")[1]["duplicate"])
+        self.assertEqual(self.post({**body, "attachments": []}, path="/api/messages")[0], 400)
+        self.assertEqual(self.post({**body, "text": "수정"}, path="/api/messages")[0], 409)
+        attachment = self.cli("msg", "read", body["messageId"])["attachments"][0]
+        path = attachment["path"]
+        self.assertTrue(os.path.isabs(path)); self.assertEqual(attachment["type"], "image/png")
+        self.assertEqual(attachment["size"], len(b"\x89PNG\r\n\x1a\nfixture"))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+        self.assertEqual(self.cli("msg", "list")["messages"][0]["attachments"][0]["path"], path)
+        public = self.get("/api/dashboard")[1]["messages"][0]["attachments"][0]
+        self.assertNotIn("path", public); self.assertNotIn("key", public)
+        with urllib.request.urlopen(self.base + "/api/uploads/" + uid) as r:
+            self.assertEqual(r.headers["Content-Type"], "image/png")
+            self.assertEqual(r.headers["Content-Security-Policy"], "sandbox")
+            self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+            self.assertEqual(r.headers["Cache-Control"], "private, no-store")
+        bdir = self.cli("backup")["path"]
+        self.assertNotIn("uploads", os.listdir(bdir))
+        self.cli("msg", "respond", body["messageId"], "--text", "확인했습니다")
+        out = self.root + "-restore-images"
+        self.addCleanup(lambda: shutil.rmtree(out, ignore_errors=True))
+        restored = self.restore(bdir, out)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(rd(os.path.join(out, "private", "messages.json"))["messages"][0]["attachments"][0]["id"], uid)
+
+    def test_image_upload_validation_and_boundaries(self):
+        for raw in (b"<html>image</html>", b"<svg xmlns='http://www.w3.org/2000/svg'/>", b"GIF89a"):
+            self.assertEqual(self.upload(raw)[0], 415)
+        for origin, site in ((False, "same-origin"), ("https://evil.example", "same-origin"), (True, "cross-site")):
+            self.assertEqual(self.upload(origin=origin, site=site)[0], 403)
+        self.assertEqual(self.upload(size=5 * 1024 * 1024 + 1)[0], 413)
+        self.assertEqual(self.upload(key="../escape")[0], 400)
+        ids = []
+        for raw, mime in ((b"\xff\xd8\xffjpeg", "image/jpeg"), (b"RIFF0000WEBPVP8 data", "image/webp")):
+            code, result = self.upload(raw)
+            self.assertEqual(code, 201); self.assertEqual(result["upload"]["type"], mime)
+            ids.append(result["upload"]["id"])
+        msg = {"messageId": secrets.token_hex(16), "kind": "general", "text": "이미지"}
+        for aids in ([secrets.token_hex(16)], ["../escape"], ["a" * 32] * 7, [ids[0]] * 2):
+            self.assertEqual(self.post({**msg, "attachments": aids}, path="/api/messages")[0], 400)
+        for path in ("/api/uploads/", "/api/uploads/../messages.json", "/api/uploads/%2e%2e%2fmessages.json", "/api/uploads/" + "f" * 32):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(self.base + path)
+            self.assertEqual(e.exception.code, 404)
+        with open(os.path.join(self.root, "private", "uploads", "quota.bin"), "wb") as f:
+            f.truncate(256 * 1024 * 1024)
+        self.assertEqual(self.upload()[0], 507)
+
+    def test_cleanup_restart_forced_enumeration_orders(self):
+        for json_first in (True, False):
+            with self.subTest(json_first=json_first):
+                linked = self.upload()[1]["upload"]["id"]
+                orphan = self.upload()[1]["upload"]["id"]
+                self.post({"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [linked]}, path="/api/messages")
+                folder = os.path.join(self.root, "private", "uploads")
+                for uid, days in ((linked, 15), (orphan, 2)):
+                    path = os.path.join(folder, uid + ".json")
+                    a = rd(path); a["created"] -= days * 86400; wr(path, a)
+                self.stop()
+                # 실제 서버 프로세스의 열거 순서를 고정하여 기동 시 정리까지 검증한다.
+                code = ("original = s.os.listdir\n"
+                        f"s.os.listdir = lambda path: sorted(original(path), key=lambda n: (not n.endswith('.json') if {json_first!r} else n.endswith('.json'), n)) if path == s.UPLOADS else original(path)")
+                self.start(code=code)
+                for uid in (linked, orphan):
+                    self.assertFalse(os.path.exists(os.path.join(folder, uid + ".png")))
+                    self.assertFalse(os.path.exists(os.path.join(folder, uid + ".json")))
+                self.assertEqual(self.upload()[0], 201)
+
+    def test_cleanup_failure_logs_and_continues(self):
+        code = """from unittest.mock import patch
+import io
+from contextlib import redirect_stderr
+with s.locked():
+    old = s.accept_upload(b'\\x89PNG\\r\\n\\x1a\\nold', 'a'*32)[0]
+    p = s.os.path.join(s.UPLOADS, old['id']+'.json')
+    a = s.load_json(p); a['created'] -= 2*86400
+    with open(p, 'w') as f: s.json.dump(a, f)
+    errors = io.StringIO()
+    with redirect_stderr(errors), patch.object(s.os, 'unlink', side_effect=PermissionError('denied')):
+        new = s.accept_upload(b'\\x89PNG\\r\\n\\x1a\\nnew', 'b'*32)[0]
+    assert new['id'] != old['id']
+    assert 'upload cleanup failed' in errors.getvalue()
+    with redirect_stderr(errors), patch.object(s.os, 'listdir', side_effect=RuntimeError('unexpected')):
+        s.cleanup_uploads()
+    assert 'unexpected' in errors.getvalue()
+"""
+        result = subprocess.run([sys.executable, "-c", "import server as s\n" + code], cwd=HERE, env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # 손상된 메타데이터도 기동·다음 업로드를 막지 않는다.
+        folder = os.path.join(self.root, "private", "uploads")
+        with open(os.path.join(folder, "c" * 32 + ".json"), "w") as f:
+            f.write("{")
+        self.stop(); self.start()
+        self.assertEqual(self.upload()[0], 201)
+
+    def test_attachment_belongs_to_one_message(self):
+        uid = self.upload()[1]["upload"]["id"]
+        body = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        self.assertEqual(self.post(body, path="/api/messages")[0], 201)
+        self.assertTrue(self.post(body, path="/api/messages")[1]["duplicate"])
+        self.assertEqual(self.post({**body, "messageId": secrets.token_hex(16)}, path="/api/messages")[0], 409)
+        self.cli("msg", "process", body["messageId"])
+        self.assertEqual(self.post({**body, "messageId": secrets.token_hex(16)}, path="/api/messages")[0], 409)
+        uid2 = self.upload()[1]["upload"]["id"]
+        barrier, codes = threading.Barrier(2), []
+        def race():
+            barrier.wait()
+            codes.append(self.post({**body, "messageId": secrets.token_hex(16), "attachments": [uid2]}, path="/api/messages")[0])
+        threads = [threading.Thread(target=race) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(3)
+        self.assertEqual(sorted(codes), [201, 409])
+
+    def raw_post(self, path, length, extra="", body=b""):
+        conn = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+        conn.sendall((f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: {self.base}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nX-Upload-Key: {secrets.token_hex(16)}\r\n{extra}\r\n").encode() + body)
+        return conn
+
+    def test_upload_read_deadline_slots_and_framing(self):
+        self.stop(); self.start(code="s.TRANSFER_IDLE_TIMEOUT = 0.8; s.TRANSFER_TOTAL_TIMEOUT = 1.5")
+        for path in ("/api/uploads", "/api/messages"):
+            for extra in ("Transfer-Encoding: chunked\r\n", "Content-Length: 1\r\n"):
+                with self.raw_post(path, 99, extra) as conn:
+                    self.assertIn(b"400", conn.recv(4096).split(b"\r\n")[0])
+            with self.raw_post(path, 99, body=b"x") as conn:
+                self.assertIn(b"408", conn.recv(4096).split(b"\r\n")[0])
+        with self.raw_post("/api/uploads", 1000) as conn:
+            end = threading.Event()
+            def trickle():
+                while not end.wait(0.1):
+                    try: conn.sendall(b"x")
+                    except OSError: return
+            sender = threading.Thread(target=trickle); sender.start()
+            try:
+                before = time.monotonic()
+                self.assertIn(b"408", conn.recv(4096).split(b"\r\n")[0])
+                self.assertLess(time.monotonic() - before, 2)
+            finally:
+                end.set(); sender.join(1)
+        connections = []
+        try:
+            # 각 서버 스레드가 본문 대기까지 진입했는지 peek timeout으로 확인한다.
+            for _ in range(4):
+                conn = self.raw_post("/api/uploads", 1000)
+                connections.append(conn); conn.settimeout(0.05)
+                with self.assertRaises(TimeoutError): conn.recv(1, socket.MSG_PEEK)
+                conn.settimeout(3)
+            with self.raw_post("/api/uploads", 1000) as extra:
+                self.assertIn(b"503", extra.recv(4096).split(b"\r\n")[0])
+            self.assertEqual(self.get("/api/dashboard")[0], 200)
+            self.assertEqual(self.post({"messageId": secrets.token_hex(16), "kind": "general", "text": "진행"}, path="/api/messages")[0], 201)
+            for conn in connections:
+                self.assertIn(b"408", conn.recv(4096).split(b"\r\n")[0])
+        finally:
+            for conn in connections: conn.close()
+        self.assertEqual(self.upload()[0], 201)  # timeout 이후 슬롯 반환
+
+    def test_progressing_slow_transfers_outlive_idle_limit(self):
+        self.stop()
+        self.start(code="""s.TRANSFER_IDLE_TIMEOUT = 0.7
+s.TRANSFER_TOTAL_TIMEOUT = 10
+s.TRANSFER_CHUNK = 4096
+original_setup = s.Handler.setup
+def setup(self):
+    original_setup(self)
+    self.connection.setsockopt(s.socket.SOL_SOCKET, s.socket.SO_SNDBUF, 4096)
+s.Handler.setup = setup
+""")
+        raw = b"\x89PNG\r\n\x1a\n" + b"p" * (128 * 1024 - 8)
+        def paced_post(path, payload, chunk):
+            started = time.monotonic()
+            with self.raw_post(path, len(payload)) as conn:
+                for i in range(0, len(payload), chunk):
+                    if i: time.sleep(0.25)
+                    conn.sendall(payload[i:i+chunk])
+                response = http.client.HTTPResponse(conn); response.begin()
+                self.assertEqual(response.status, 201)
+                result = json.loads(response.read())
+            self.assertGreater(time.monotonic() - started, 0.7)
+            return result
+        uid = paced_post("/api/uploads", raw, 16 * 1024)["upload"]["id"]
+        paced_post("/api/messages", json.dumps({"messageId": secrets.token_hex(16), "kind": "general", "text": "p" * 1400}).encode(), 200)
+        folder = os.path.join(self.root, "captures", "paced"); os.makedirs(folder)
+        with open(os.path.join(folder, "image.png"), "wb") as f: f.write(raw)
+        for path in ("/api/uploads/" + uid,):
+            with self.subTest(path=path), socket.socket() as conn:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024)
+                conn.settimeout(3); conn.connect(("127.0.0.1", self.port))
+                conn.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+                response = http.client.HTTPResponse(conn); response.begin()
+                self.assertEqual(response.status, 200)
+                received, started = bytearray(), time.monotonic()
+                while len(received) < len(raw):
+                    chunk = response.read(min(16 * 1024, len(raw) - len(received)))
+                    self.assertTrue(chunk, "느린 정상 다운로드를 자르면 안 됩니다")
+                    received.extend(chunk)
+                    if len(received) < len(raw): time.sleep(0.25)
+                self.assertEqual(bytes(received), raw)
+                self.assertGreater(time.monotonic() - started, 0.7)
+
+    def test_invalid_metadata_is_skipped_everywhere(self):
+        uid = self.upload()[1]["upload"]["id"]
+        message = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        self.post(message, path="/api/messages")
+        folder = os.path.join(self.root, "private", "uploads")
+        valid = rd(os.path.join(folder, uid + ".json"))
+        for value in ([], None, "text", {}, {**valid, "id": "wrong"}, {**valid, "ext": []}, {**valid, "size": "2"}, {**valid, "created": float("inf")}, {**valid, "created": 10**400}):
+            with self.subTest(value_type=type(value).__name__):
+                wr(os.path.join(folder, uid + ".json"), value)
+                self.assertEqual(self.upload()[0], 201)
+                self.assertFalse(self.get("/api/dashboard")[1]["messages"][0]["attachments"][0]["available"])
+                self.assertIsNone(self.cli("msg", "read", message["messageId"])["attachments"][0]["path"])
+                self.assertEqual(self.post({**message, "messageId": secrets.token_hex(16)}, path="/api/messages")[0], 409)
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(self.base + "/api/uploads/" + uid)
+                self.assertEqual(error.exception.code, 404)
+        self.stop(); self.start()
+        self.assertEqual(self.upload()[0], 201)
+
+    def test_response_write_timeout_releases_slow_connection(self):
+        uid = self.upload(b"\x89PNG\r\n\x1a\n" + b"x" * (5 * 1024 * 1024 - 8))[1]["upload"]["id"]
+        self.stop()
+        code = """s.TRANSFER_IDLE_TIMEOUT = 0.3; s.TRANSFER_TOTAL_TIMEOUT = 2
+original_log = s.Handler.log_message
+def log(self, fmt, *args):
+    if fmt.startswith('response write failed') and self.path.startswith('/api/uploads/'):
+        with open(s.os.path.join(s.ROOT, 'write-timeout'), 'w') as f: f.write(str(args))
+    original_log(self, fmt, *args)
+s.Handler.log_message = log
+"""
+        self.start(code=code)
+        with socket.socket() as conn:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+            conn.settimeout(3); conn.connect(("127.0.0.1", self.port))
+            conn.sendall(f"GET /api/uploads/{uid} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+            self.assertTrue(conn.recv(1, socket.MSG_PEEK))
+            marker = os.path.join(self.root, "write-timeout")
+            deadline = time.monotonic() + 2
+            while (not os.path.exists(marker) or not slurp(marker)) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(marker), "느린 다운로드의 소켓 쓰기가 시간 제한으로 끝나야 합니다")
+            self.assertIn(b"timed out", slurp(marker))
+
+    def test_slow_image_and_capture_do_not_hold_data_lock(self):
+        raw = b"\x89PNG\r\n\x1a\n" + b"x" * (5 * 1024 * 1024 - 8)
+        uid = self.upload(raw)[1]["upload"]["id"]
+        msg = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        self.post(msg, path="/api/messages")
+        folder = os.path.join(self.root, "captures", "slow"); os.makedirs(folder)
+        with open(os.path.join(folder, "large.png"), "wb") as f: f.write(raw)
+        for path in ("/api/uploads/" + uid,):
+            with self.subTest(path=path), socket.socket() as conn:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+                conn.settimeout(3); conn.connect(("127.0.0.1", self.port))
+                conn.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+                # 첫 바이트만 관찰하고 읽지 않는다. 5MiB 응답은 작은 수신 버퍼에서 전송 대기한다.
+                self.assertTrue(conn.recv(1, socket.MSG_PEEK))
+                time.sleep(0.1)
+                with urllib.request.urlopen(self.base + "/api/dashboard", timeout=2) as response:
+                    self.assertEqual(response.status, 200)
+                req = urllib.request.Request(self.base + "/api/messages", data=json.dumps({"messageId": secrets.token_hex(16), "kind": "general", "text": "다운로드 중 전송"}).encode(), headers={"Origin": self.base, "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=2) as response:
+                    self.assertEqual(response.status, 201)
+                for args in (("item", "get", self.ids()["work"][0]), ("item", "set", self.ids()["work"][0], "--set", "status=다운로드 중 확인", "--reason", "느린 응답 병행 검증"), ("msg", "list"), ("msg", "read", msg["messageId"])):
+                    result = subprocess.run([sys.executable, os.path.join(HERE, "server.py"), *args], env=self.env, capture_output=True, text=True, timeout=2)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_image_cleanup_orphan_and_linked_expiry(self):
+        linked = self.upload()[1]["upload"]["id"]
+        orphan = self.upload()[1]["upload"]["id"]
+        body = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [linked]}
+        self.post(body, path="/api/messages")
+        folder = os.path.join(self.root, "private", "uploads")
+        def age(uid, days):
+            p = os.path.join(folder, uid + ".json"); a = rd(p); a["created"] -= days * 86400; wr(p, a)
+        age(orphan, 2); age(linked, 2)
+        self.upload()  # 새 업로드에서 미연결 파일만 1일 기준으로 지운다.
+        self.assertFalse(os.path.exists(os.path.join(folder, orphan + ".png")))
+        self.assertTrue(os.path.exists(os.path.join(folder, linked + ".png")))
+        age(linked, 13)
+        self.stop(); self.start()  # 기동 시 14일 지난 연결 파일을 지운다.
+        self.assertFalse(os.path.exists(os.path.join(folder, linked + ".png")))
+        self.assertFalse(self.get("/api/dashboard")[1]["messages"][0]["attachments"][0]["available"])
+        self.assertIsNone(self.cli("msg", "read", body["messageId"])["attachments"][0]["path"])
+        self.assertTrue(self.post(body, path="/api/messages")[1]["duplicate"])
 
     def test_full_flow_hidden_persists(self):
         ids = self.ids()
@@ -1022,9 +1332,10 @@ class T(unittest.TestCase):
         """운영 루트의 data·private 파일 내용과 권한(백업 디렉터리 제외)."""
         out = {}
         for d in ("public", "private"):
-            for n in sorted(os.listdir(os.path.join(self.root, d))):
-                p = os.path.join(self.root, d, n)
-                out[f"{d}/{n}"] = (slurp(p), oct(os.stat(p).st_mode & 0o777))
+            for folder, _, names in os.walk(os.path.join(self.root, d)):
+                for n in sorted(names):
+                    p = os.path.join(folder, n)
+                    out[os.path.relpath(p, self.root)] = (slurp(p), oct(os.stat(p).st_mode & 0o777))
         return out
 
     def test_backup_daily_first_and_manual(self):

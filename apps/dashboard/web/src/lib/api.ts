@@ -27,3 +27,11 @@ export async function copyText(text: string) {
   ta.remove(); prev?.focus?.({ preventScroll: true });
   return ok;
 }
+
+// 업로드 키는 첨부 초안과 함께 메모리에 남아 응답 유실 후 재시도에도 같은 파일을 한 번만 저장한다.
+export async function uploadImage(file: File, key: string): Promise<{ id: string }> {
+  const r = await fetch('api/uploads', { method: 'POST', headers: { 'Content-Type': file.type, 'X-Upload-Key': key }, cache: 'no-store', body: file });
+  const body = await r.json();
+  if (!r.ok || !body.upload) throw new HttpError(body.error || `HTTP ${r.status}`, r.status);
+  return body.upload;
+}
