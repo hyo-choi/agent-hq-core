@@ -14,7 +14,8 @@
   python3 server.py msg link MSG_ID --item HQ-12|ID [--note]  # coordinator 분류: 메시지를 작업·질문·PR·결정에 연결(원문·kind·itemId 유지)
   python3 server.py msg unlink MSG_ID [--note]                 # 연결 해제(원래 위치로 돌아간다, 기록은 linkHistory에 남는다)
   python3 server.py lookup HQ-12 [w-xxxxxxxx ...]      # 사람용 HQ 번호(또는 내부 id)로 원본 항목과 숨김 여부 조회 (숨긴 항목 포함)
-  python3 server.py flush register --provider codex --thread UUID --evidence TEXT  # '지금 확인 요청' 대상 coordinator thread 명시 등록
+  python3 server.py flush register --self [--evidence TEXT]                        # '지금 확인 요청' 대상으로 이 세션(Claude·Codex)을 자기 등록(이전 등록 교체)
+  python3 server.py flush register --provider codex --thread UUID --evidence TEXT  # Codex thread를 명시 등록(--self를 쓸 수 없을 때)
   python3 server.py flush unregister|status|done --id FLUSH_ID [--note]            # 등록 해제 / 상태 조회 / coordinator 처리 기록
   python3 server.py item add work|question|decision --file F.json [--set K=V] [--reason]   # 새 항목(영속 id·HQ 번호 부여, state 기본 open)
   python3 server.py item get HQ-12|ID                                                   # 원본과 rev 조회(읽기 전용)
@@ -85,11 +86,12 @@ LISTS = {"work": ("work", "w"), "question": ("questions", "q"), "decision": ("pe
 FLUSH = os.path.join(PRIVATE, "flush.json")  # '지금 확인 요청': 등록된 coordinator thread와 요청 기록
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_BIN = os.environ.get("HQ_CODEX_BIN") or "codex"  # 테스트는 가짜 스크립트로 바꾼다
+CLAUDE_FLUSH = os.environ.get("HQ_ENABLE_CLAUDE_FLUSH") == "1"  # 독립 opt-in. Codex 설정은 이 값을 켜지 않는다
 CODEX_FLUSH = os.environ.get("HQ_ENABLE_CODEX_FLUSH") == "1"  # opt-in. 끄면 등록·전송을 하지 않는다
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 QUEUED_RE = re.compile(r"Queued message ([0-9a-f-]{36}) for thread")
 FLUSH_COOLDOWN = 60    # 마지막 요청 후 이 시간(초) 안에는 새로 보내지 않는다
-FLUSH_TIMEOUT = 15     # codex queue 실행 timeout(초)
+FLUSH_TIMEOUT = 15     # codex queue 실행·Claude socket 연결 timeout(초)
 FLUSH_KEEP = 200       # ponytail: 기록 상한. 넘으면 오래된 것부터 버린다
 # 고정 문구. 들어가는 값은 서버가 만든 flushId뿐이다. 사용자 문자열은 넣지 않는다
 FLUSH_MESSAGE = ("[HQ flush {fid}] 진행판 사용자가 '지금 확인 요청'을 눌렀습니다. 진행판 요청함을 지금 확인하세요"
@@ -907,11 +909,11 @@ def close_stale_sending(box):
     return changed
 
 
-def deliver_codex(thread, fid):
+def deliver_codex(reg, fid):
     if not CODEX_FLUSH:
         return "failed", None, "HQ_ENABLE_CODEX_FLUSH=1이 아니라 보내지 않았습니다"
     try:
-        r = subprocess.run([CODEX_BIN, "queue", "--thread", thread, "--message", FLUSH_MESSAGE.format(fid=fid, root=ROOT)],
+        r = subprocess.run([CODEX_BIN, "queue", "--thread", reg["thread"], "--message", FLUSH_MESSAGE.format(fid=fid, root=ROOT)],
                            capture_output=True, text=True, timeout=FLUSH_TIMEOUT, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return "failed", None, f"{FLUSH_TIMEOUT}초 timeout(적재 여부 미확인)"
@@ -922,6 +924,35 @@ def deliver_codex(thread, fid):
         return "queued", m.group(1), None
     lines = (r.stderr or r.stdout).strip().splitlines()
     return "failed", None, (lines[-1] if lines else f"exit {r.returncode}")[:300]
+
+
+# 과도기 구현: socket 메시지 형식({"type":"auth","token"}, {"type":"user","message":{...}} 한 줄씩)은 공식 문서에 없고
+# Claude Code 2.1.328 바이너리와 격리 실험의 관찰에 근거한다. 공식 문서가 보장하는 것은 inbox socket과 세션 토큰 인증까지다.
+# 버전을 올린 뒤 첫 사용에서 다시 확인해야 하며, 공식 전달 CLI·API가 생기면 이 경로를 그쪽으로 교체한다.
+# 한계: socket은 응답이 없어(ack 없음) 전달·보류·거절을 송신자가 알 수 없다. 세션이 끝난 뒤 같은 pid를 받은 다른 세션이 같은
+# socket 경로를 쓰면 그 세션이 고정 알림을 받을 수 있다(PID 재사용 방어용 내부 레지스트리 파일은 읽지 않기로 했다).
+# 반대로 bypass 세션에서는 토큰이 다르면 전달되지 않고 승인 대화상자로 보류된다. 토큰은 프로세스마다 바뀌므로 resume하면 재등록이 필요하다.
+def deliver_claude(reg, fid):
+    if not CLAUDE_FLUSH:
+        return "failed", None, "HQ_ENABLE_CLAUDE_FLUSH=1이 아니라 보내지 않았습니다"
+    auth = json.dumps({"type": "auth", "token": reg["claude"]["token"]})
+    msg = json.dumps({"type": "user", "message": {"role": "user", "content": FLUSH_MESSAGE.format(fid=fid, root=ROOT)}})
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(FLUSH_TIMEOUT); s.connect(reg["claude"]["socket"])
+            s.sendall((auth + "\n" + msg + "\n").encode())
+    except FileNotFoundError:
+        return "failed", None, "등록된 Claude 세션이 종료되었습니다(세션에서 다시 등록해야 합니다)"
+    except OSError as e:
+        return "failed", None, f"Claude 세션에 연결하지 못했습니다: {e.__class__.__name__}"
+    return "queued", None, None  # ack가 없어 socket에 썼다는 것까지만 안다
+
+
+DELIVER = {"codex": deliver_codex, "claude": deliver_claude}
+
+
+def flush_is_open(f, reg):
+    return bool(reg and f["status"] in ("sending", "queued") and f["thread"] == reg["thread"] and f["createdAt"] >= reg["registeredAt"])
 
 
 def accept_flush(body):
@@ -935,9 +966,9 @@ def accept_flush(body):
             if f["flushId"] == fid:  # 같은 요청 재전송
                 return f, True
         reg = box["registration"]
-        if reg:  # 같은 thread에 coordinator가 처리 기록(done)을 남기지 않은 요청이 있으면 다시 쌓지 않는다
+        if reg:  # 같은 thread에 coordinator가 처리 기록(done)을 남기지 않은 요청이 있으면 다시 쌓지 않는다. 재등록 전(옛 토큰·socket)에 보낸 요청은 열린 요청으로 보지 않는다
             for f in reversed(box["flushes"]):
-                if f["status"] in ("sending", "queued") and f["thread"] == reg["thread"]:
+                if flush_is_open(f, reg):
                     return f, True
         if box["flushes"] and (wait := FLUSH_COOLDOWN - age_sec(box["flushes"][-1]["createdAt"])) > 0:
             raise BadRequest(429, f"{int(wait) + 1}초 후에 다시 요청할 수 있습니다")
@@ -949,7 +980,7 @@ def accept_flush(body):
         write_json(FLUSH, box)
     if not reg:
         return f, False
-    status, qid, err = deliver_codex(reg["thread"], fid)  # 락 밖에서 실행한다(최대 FLUSH_TIMEOUT초)
+    status, qid, err = DELIVER[reg["provider"]](reg, fid)  # 락 밖에서 실행한다(최대 FLUSH_TIMEOUT초)
     with locked():
         box = load_flush()
         f = next(x for x in box["flushes"] if x["flushId"] == fid)
@@ -961,8 +992,35 @@ def accept_flush(body):
 def flush_public(box):
     reg = box["registration"]
     return {"registration": reg and {k: reg[k] for k in ("provider", "threadName", "registeredAt")},
-            "recent": [{k: v for k, v in f.items() if k not in ("thread", "queueMessageId")} for f in box["flushes"][-5:]],
+            "recent": [{**{k: v for k, v in f.items() if k not in ("thread", "queueMessageId")},
+                        "active": flush_is_open(f, reg)} for f in box["flushes"][-5:]],
             "cooldownSec": FLUSH_COOLDOWN}
+
+
+def self_identity(provider=None):
+    """--self: 이 프로세스의 환경변수로 등록할 세션을 정한다. (provider, thread, 이름, 등록에 더할 필드)를 돌려준다.
+    token은 환경변수에서만 읽는다(argv로 받으면 ps에 보인다). provider를 주지 않았는데 Claude·Codex 변수가 함께 있으면
+    (예: Claude에서 띄운 Codex가 변수를 상속) 추측하지 않고 종료한다. 판정 근거가 없으면 종료한다."""
+    env = os.environ
+    sid, sock, token = (env.get(k) for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"))
+    tid = env.get("CODEX_THREAD_ID")
+    if provider is None and (sid or sock or token) and tid:
+        sys.exit("Claude와 Codex 환경변수가 함께 있어 판정할 수 없습니다. --self --provider claude|codex로 지정하세요")
+    if provider == "claude" or (provider is None and (sid or sock or token)):
+        if not (sid and sock and token):
+            sys.exit("Claude 세션 환경변수(CLAUDE_CODE_SESSION_ID·MESSAGING_SOCKET·MESSAGING_TOKEN)가 일부만 있습니다")
+        if not UUID_RE.match(sid):
+            sys.exit("CLAUDE_CODE_SESSION_ID가 UUID 형식이 아닙니다")
+        try:
+            st = os.stat(sock)
+        except OSError:
+            sys.exit("Claude inbox socket이 없습니다")
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            sys.exit("Claude inbox socket이 현재 사용자의 Unix socket이 아닙니다")
+        return "claude", sid, f"claude-{sid[:8]}", {"claude": {"socket": sock, "token": token}}
+    if tid:
+        return "codex", tid, codex_thread_name(tid) if UUID_RE.match(tid) else None, {}
+    sys.exit("자기 세션을 판정할 환경변수가 없습니다. Codex면 --provider codex --thread UUID로 등록하세요")
 
 
 def flush_cli(a):
@@ -970,16 +1028,26 @@ def flush_cli(a):
         box = load_flush()
         changed = close_stale_sending(box)
         if a.fcmd == "register":
-            if not CODEX_FLUSH:
-                sys.exit("Codex 알림은 opt-in입니다. HQ_ENABLE_CODEX_FLUSH=1로 실행하세요")
-            if not UUID_RE.match(a.thread):
-                sys.exit("thread는 Codex session UUID여야 합니다")
-            name = codex_thread_name(a.thread)
+            if a.self_:
+                provider, thread, name, extra = self_identity(a.provider)
+            elif a.provider == "codex" and a.thread:
+                provider, thread, extra = a.provider, a.thread, {}
+                name = codex_thread_name(thread) if UUID_RE.match(thread) else None
+            else:
+                sys.exit("--self 또는 --provider codex와 --thread가 필요합니다(Claude는 --self로만 등록합니다)")
+            enabled = CODEX_FLUSH if provider == "codex" else CLAUDE_FLUSH
+            if not enabled:
+                sys.exit(f"{provider} 알림은 opt-in입니다. HQ_ENABLE_{provider.upper()}_FLUSH=1로 실행하세요")
+            if not UUID_RE.match(thread):
+                sys.exit("thread는 session UUID여야 합니다")
             if name is None:
                 sys.exit(f"{CODEX_HOME}/session_index.jsonl에 없는 thread입니다")
+            if not (a.evidence or a.self_):
+                sys.exit("--evidence가 필요합니다")
             prev = box["registration"]
-            box["registration"] = {"provider": a.provider, "thread": a.thread, "threadName": name, "registeredAt": now(),
-                                   "evidence": a.evidence, "previousThread": prev and prev["thread"]}
+            box["registration"] = {"provider": provider, "thread": thread, "threadName": name, "registeredAt": now(),
+                                   "evidence": a.evidence or "세션 자기 등록(--self)", **extra,
+                                   "previous": prev and {"provider": prev["provider"], "thread": prev["thread"]}}
             changed = True
         elif a.fcmd == "unregister":
             changed, box["registration"] = box["registration"] is not None, None
@@ -991,7 +1059,8 @@ def flush_cli(a):
                 f.update(status="processed", processedAt=now(), processNote=a.note or None); changed = True
         if changed:
             write_json(FLUSH, box)
-    return {"registration": box["registration"], "flushes": box["flushes"][-10:]}
+    reg = box["registration"]  # 출력에는 Claude 세션 토큰·socket 경로를 내보내지 않는다
+    return {"registration": reg and {k: v for k, v in reg.items() if k != "claude"}, "flushes": box["flushes"][-10:]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1729,10 +1798,11 @@ def main(argv=None):
     m = ms.add_parser("link", help="메시지를 작업·질문·PR·결정에 분류 연결"); m.add_argument("id"); m.add_argument("--item", required=True, help="HQ-12 또는 내부 id")
     m.add_argument("--note")
     m = ms.add_parser("unlink"); m.add_argument("id"); m.add_argument("--note")
-    s = sub.add_parser("flush", help="'지금 확인 요청' 대상 coordinator thread 등록과 요청 기록")
+    s = sub.add_parser("flush", help="'지금 확인 요청' 대상 coordinator 세션 등록과 요청 기록")
     fs = s.add_subparsers(dest="fcmd", required=True)
-    f = fs.add_parser("register"); f.add_argument("--provider", choices=["codex"], required=True)
-    f.add_argument("--thread", required=True, help="Codex session UUID"); f.add_argument("--evidence", required=True, help="이 대화의 thread라고 확인한 근거")
+    f = fs.add_parser("register"); f.add_argument("--self", dest="self_", action="store_true", help="자기 환경변수로 provider(Claude·Codex)를 판정해 이 세션을 등록")
+    f.add_argument("--provider", choices=["codex", "claude"], help="--thread와 함께: Codex 명시 등록. --self와 함께: 그 provider의 자기 환경변수로 등록(Claude·Codex 변수가 함께 있을 때)")
+    f.add_argument("--thread", help="Codex session UUID"); f.add_argument("--evidence", help="이 대화의 thread라고 확인한 근거(--self이면 생략 가능)")
     fs.add_parser("unregister"); fs.add_parser("status")
     f = fs.add_parser("done"); f.add_argument("--id", required=True); f.add_argument("--note")
     s = sub.add_parser("item", help="업무·질문·결정 항목 추가·조회·수정·결정 해소(data.json의 유일한 쓰기 경로)")

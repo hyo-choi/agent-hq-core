@@ -219,7 +219,7 @@ function MsgSections() {
 // 서버가 등록된 Codex coordinator 세션에 고정 알림만 대기열로 넣는다. 사용자 글은 보내지 않으며, 적재는 처리 완료가 아니다.
 // ponytail: 탭을 옮겨도 유지되게 모듈 상태로 둔다. 응답을 잃으면 같은 번호로 다시 보내 서버가 한 번만 실행하게 한다
 const flushSt = { fid: null as string | null, busy: false, err: '' };
-const FLUSH_ST: Record<string, [string, string]> = { sending: ['전송 중', 'badge-ghost'], queued: ['대기열 적재됨', 'badge-info'] };
+const FLUSH_ST: Record<string, [string, string]> = { sending: ['전송 중', 'badge-ghost'], queued: ['알림 보냄', 'badge-info'] };
 function FlushCard() {
   const { snap, toast, reload } = useApp(), FL = snap.flush;
   const [, rerender] = useState(0), hid = useId(); useShared();
@@ -230,7 +230,7 @@ function FlushCard() {
   const wait = last ? Math.ceil((FL!.cooldownSec || 60) - (Date.now() - new Date(last.createdAt).getTime()) / 1000) : 0;
   // 재요청 대기가 끝나면 버튼을 다시 켠다
   useEffect(() => { if (wait > 0) { const t = setTimeout(() => rerender(n => n + 1), wait * 1000); return () => clearTimeout(t); } }, [wait, last?.createdAt]);
-  const open = reg && recent.find(f => (f.status === 'queued' || f.status === 'sending') && f.threadName === reg.threadName);
+  const open = reg && recent.find(f => f.active === true);
   const failed = reg && !open && wait > 0 && last.status === 'failed' ? last : null;  // ponytail: 재요청 대기 동안만 직전 실패를 보인다
   const click = async () => {
     if (flushSt.busy) return;
@@ -242,7 +242,7 @@ function FlushCard() {
       });
       flushSt.fid = null;
       const st = body.flush.status;
-      toast(body.duplicate ? '처리 기록 전인 확인 요청이 이미 있습니다.' : st === 'queued' ? '확인 요청을 세션 대기열에 넣었습니다. 처리되면 진행 중 표시가 사라집니다.'
+      toast(body.duplicate ? '처리 기록 전인 확인 요청이 이미 있습니다.' : st === 'queued' ? '확인 요청을 담당 세션에 보냈습니다. 처리되면 진행 중 표시가 사라집니다.'
         : `전달하지 못했습니다: ${body.flush.error || st}`, st === 'queued' || body.duplicate ? 'ok' : 'err');
     } catch (e: any) {
       setErr(`보내지 못했습니다: ${e.message}.` + (flushSt.fid ? ' 다시 시도하면 같은 요청 번호라 중복 전송되지 않습니다.' : ''));
@@ -251,8 +251,8 @@ function FlushCard() {
   };
   return <section class="card card-border bg-base-100" aria-labelledby={hid}><div class="card-body gap-2 p-4 sm:p-5">
     <h3 id={hid} class="font-semibold">지금 확인 요청</h3>
-    <Muted>담당 에이전트 세션에 "요청함을 지금 확인하라"는 고정 알림을 보냅니다. 쓴 글은 함께 보내지 않습니다. 요청함의 메시지와 삭제 요청은 에이전트가 운영 지침대로 처리하고 결과를 기록합니다. 대기열에 넣은 것만으로 처리된 것은 아닙니다.</Muted>
-    <Muted cls="text-xs">{reg ? `대상: Codex 세션 "${reg.threadName}" · 등록 ${fmt(reg.registeredAt)}` : '미전달: 등록된 담당 에이전트 세션이 없어 보낼 수 없습니다. 에이전트가 세션을 등록하면 쓸 수 있습니다.'}</Muted>
+    <Muted>담당 에이전트 세션에 "요청함을 지금 확인하라"는 고정 알림을 보냅니다. 쓴 글은 함께 보내지 않습니다. 요청함의 메시지와 삭제 요청은 에이전트가 운영 지침대로 처리하고 결과를 기록합니다. 알림을 보낸 것만으로 처리된 것은 아닙니다.</Muted>
+    <Muted cls="text-xs">{reg ? `대상: ${reg.provider === 'claude' ? 'Claude' : 'Codex'} 세션 "${reg.threadName}" · 등록 ${fmt(reg.registeredAt)}` : '미전달: 등록된 담당 에이전트 세션이 없어 보낼 수 없습니다. 에이전트가 세션을 등록하면 쓸 수 있습니다.'}</Muted>
     {reg ? <div class="flex flex-wrap items-center gap-1.5 text-xs text-base-content/60">
       {open ? <><Badge cls={FLUSH_ST[open.status][1]}>{'진행 중 · ' + FLUSH_ST[open.status][0]}</Badge>{`요청 ${fmt(open.createdAt)}`}</> : <Badge>진행 중인 요청 없음</Badge>}</div> : null}
     {open && open.status === 'queued' ? <Muted cls="text-xs">세션에 알림을 넣었습니다. 쉬고 있으면 바로, 작업 중이면 지금 작업이 끝난 뒤 확인합니다. 에이전트가 처리를 기록하면 진행 중 표시가 사라집니다.</Muted> : null}

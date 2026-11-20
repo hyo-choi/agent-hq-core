@@ -27,11 +27,22 @@ beforeEach(() => {
     return new Response(JSON.stringify({ [field]: body, duplicate: false }), { status: 201 });
   }));
 });
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 const refresh = () => act(async () => { document.dispatchEvent(new Event('visibilitychange')); await new Promise(r => setTimeout(r, 0)); });
 const tabBtn = (name: string) => screen.getAllByRole('tab').find(b => b.textContent!.startsWith(name))!;
 
 describe('App', () => {
+  it('같은 이름으로 재등록하면 이전 queued 요청이 새 버튼을 막지 않는다', async () => {
+    snap.flush = { registration: { provider: 'codex', threadName: '합성 세션', registeredAt: '2030-02-02T00:00:00Z' },
+      recent: [{ flushId: 'old', status: 'queued', threadName: '합성 세션', createdAt: '2030-02-01T00:00:00Z', active: false }], cooldownSec: 60 };
+    vi.spyOn(Date, 'now').mockReturnValue(new Date('2030-02-03T00:00:00Z').getTime());
+    sessionStorage.setItem('tab', '"inbox"');
+    render(<App />);
+    const b = await screen.findByRole('button', { name: '지금 확인 요청' });
+    expect(b.hasAttribute('disabled')).toBe(false);
+    vi.restoreAllMocks();
+  });
+
   it('이미지 선택·붙여 넣기·드롭·제거와 한도를 적용하고 이미지 전송을 같은 번호로 재시도한다', async () => {
     sessionStorage.setItem('tab', '"requests"');
     // 독립 초안 키로 기존 텍스트 재시도 테스트와 전송 상태를 공유하지 않는다.
@@ -767,7 +778,7 @@ describe('App', () => {
     const panel = () => document.querySelector('[role=dialog][aria-label="메시지 보내기"]')!;
     const flushBtn = () => [...panel().querySelectorAll('button')].find(b => b.textContent === '지금 확인 요청') as HTMLButtonElement;
     expect(flushBtn().disabled).toBe(false);
-    snap.flush = { ...snap.flush, recent: [{ status: 'queued', createdAt: now, threadName: 'coord' }] };
+    snap.flush = { ...snap.flush, recent: [{ status: 'queued', createdAt: now, threadName: 'coord', active: true }] };
     await act(async () => { fireEvent.click(flushBtn()); await new Promise(r => setTimeout(r, 0)); });
     await waitFor(() => expect(posts.length).toBe(1));
     expect(posts[0][0]).toBe('api/flush');

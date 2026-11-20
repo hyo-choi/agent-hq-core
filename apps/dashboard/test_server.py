@@ -93,7 +93,9 @@ class T(unittest.TestCase):
         self.env = {**os.environ, "HQ_DASH_ROOT": self.root, "PATH": bindir + os.pathsep + os.environ["PATH"], "CODEX_HOME": self.codex_home,
                     "HQ_TASKS_DIR": os.path.join(self.root, "tasks"),
                     # 외부 연동은 기본 꺼짐이다. 테스트는 가짜 gh·codex와 합성 값으로만 켠다
-                    "HQ_GITHUB_REPO": "example/repo", "HQ_JIRA_PROJECT": "DEMO", "HQ_ENABLE_CODEX_FLUSH": "1"}
+                    "HQ_GITHUB_REPO": "example/repo", "HQ_JIRA_PROJECT": "DEMO", "HQ_ENABLE_CODEX_FLUSH": "1", "HQ_ENABLE_CLAUDE_FLUSH": "1"}
+        for key in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"):
+            self.env.pop(key, None)
         self.cli("migrate-ids")
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
@@ -1277,6 +1279,149 @@ s.Handler.log_message = log
         self.assertEqual(self.flush(r["flush"]["flushId"])[1]["duplicate"], True)  # 같은 id 재전송은 다시 실행하지 않는다
         self.assertEqual(len(self.codex_calls()), 1)
         self.assertNotEqual(self.cli_fail("flush", "done", "--id", r["flush"]["flushId"]).returncode, 0)  # 실패 건은 처리 기록 대상이 아니다
+
+    # 가짜 Claude inbox: 받은 줄을 모아 두는 Unix socket 리스너. 경로 길이 제한 때문에 /tmp 아래 짧은 디렉터리를 쓴다
+    def fake_claude(self):
+        d = tempfile.mkdtemp(prefix="hq", dir="/tmp"); self.addCleanup(shutil.rmtree, d, True)
+        path, lines = os.path.join(d, "s.sock"), []
+        srv = socket.socket(socket.AF_UNIX); srv.bind(path); srv.listen(5); self.addCleanup(srv.close)
+
+        def run():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                with c:
+                    buf = b""
+                    while chunk := c.recv(4096):
+                        buf += chunk
+                lines.extend(buf.decode().splitlines())
+        threading.Thread(target=run, daemon=True).start()
+        return path, lines
+
+    def self_env(self, sid, sock, token="tok-SECRET"):
+        return {**self.env, "CLAUDE_CODE_SESSION_ID": sid, "CLAUDE_CODE_MESSAGING_SOCKET": sock, "CLAUDE_CODE_MESSAGING_TOKEN": token}
+
+    def register_self(self, env):
+        out = subprocess.run([sys.executable, os.path.join(HERE, "server.py"), "flush", "register", "--self"], env=env, capture_output=True, text=True)
+        return out
+
+    def test_flush_claude_self_register_deliver_and_secrets(self):
+        sock, lines = self.fake_claude()
+        sid = "00000000-0000-4000-8000-000000000042"
+        out = self.register_self(self.self_env(sid, sock))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        reg = json.loads(out.stdout)["registration"]
+        self.assertEqual((reg["provider"], reg["thread"]), ("claude", sid))
+        for text in (out.stdout, json.dumps(self.cli("flush", "status")), json.dumps(self.get("/api/dashboard")[1])):
+            self.assertNotIn("tok-SECRET", text); self.assertNotIn(sock, text)
+        self.assertEqual(self.get("/api/dashboard")[1]["flush"]["registration"]["provider"], "claude")
+        fid = secrets.token_hex(16)
+        code, r = self.flush(fid)
+        self.assertEqual((code, r["flush"]["status"]), (201, "queued"))
+        self.assertNotIn("thread", r["flush"]); self.assertNotIn("tok-SECRET", json.dumps(r)); self.assertNotIn(sock, json.dumps(r))
+        for _ in range(50):
+            if len(lines) >= 2: break
+            time.sleep(0.05)
+        self.assertEqual(json.loads(lines[0]), {"type": "auth", "token": "tok-SECRET"})
+        self.assertEqual(json.loads(lines[1]), {"type": "user", "message": {"role": "user", "content": __import__("server").FLUSH_MESSAGE.format(fid=fid, root=self.root)}})
+        self.assertEqual(self.codex_calls(), [])
+        self.assertEqual(self.cli("flush", "done", "--id", fid)["flushes"][-1]["status"], "processed")
+
+    def test_flush_claude_socket_gone_fails(self):
+        sock, _ = self.fake_claude()
+        self.assertEqual(self.register_self(self.self_env("00000000-0000-4000-8000-000000000042", sock)).returncode, 0)
+        os.unlink(sock)  # 세션 종료로 socket이 사라진 상황
+        code, r = self.flush()
+        self.assertEqual((code, r["flush"]["status"]), (201, "failed"))
+        self.assertIn("종료", r["flush"]["error"])
+        self.assertNotEqual(self.cli_fail("flush", "done", "--id", r["flush"]["flushId"]).returncode, 0)
+
+    def test_flush_self_register_validation(self):
+        sock, _ = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
+        env_no = {k: v for k, v in self.env.items() if not k.startswith(("CLAUDE_CODE_", "CODEX_THREAD_ID"))}
+        for env in (self.self_env("not-a-uuid", sock),                      # session id 형식
+                    self.self_env(sid, os.path.join(os.path.dirname(sock), "none.sock")),  # socket 없음
+                    self.self_env(sid, self.data),                          # socket이 아닌 일반 파일
+                    {**env_no, "CLAUDE_CODE_SESSION_ID": sid},              # 일부 변수만 있음
+                    env_no):                                                # 판정 근거 없음
+            self.assertNotEqual(self.register_self(env).returncode, 0)
+        self.assertIsNone(self.cli("flush", "status")["registration"])
+        # token을 argv로 받는 옵션은 없다
+        self.assertNotEqual(self.cli_fail("flush", "register", "--self", "--token", "x").returncode, 0)
+
+    def test_flush_self_codex_env_and_provider_switch(self):
+        sock, lines = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
+        env_no = {k: v for k, v in self.env.items() if not k.startswith("CLAUDE_CODE_")}
+        out = self.register_self({**env_no, "CODEX_THREAD_ID": THREAD})
+        self.assertEqual((json.loads(out.stdout)["registration"]["provider"], json.loads(out.stdout)["registration"]["threadName"]), ("codex", "합성 coordinator"))
+        self.assertNotEqual(self.register_self({**env_no, "CODEX_THREAD_ID": "00000000-0000-7000-8000-000000000000"}).returncode, 0)
+        # Codex → Claude 교체: 이전 등록이 남고 새 provider에만 보낸다
+        reg = json.loads(self.register_self(self.self_env(sid, sock)).stdout)["registration"]
+        self.assertEqual(reg["previous"], {"provider": "codex", "thread": THREAD})
+        self.assertEqual(self.flush()[1]["flush"]["status"], "queued")
+        self.assertEqual(self.codex_calls(), [])
+        for _ in range(50):
+            if len(lines) >= 2: break
+            time.sleep(0.05)
+        self.assertEqual(len(lines), 2)
+        # Claude → Codex 교체 뒤에는 Claude socket에 더 보내지 않는다
+        self.cli("flush", "done", "--id", self.cli("flush", "status")["flushes"][-1]["flushId"])
+        reg = self.cli("flush", "register", "--provider", "codex", "--thread", THREAD, "--evidence", "e")["registration"]
+        self.assertEqual(reg["previous"], {"provider": "claude", "thread": sid})
+        box = rd(os.path.join(self.root, "private", "flush.json")); box["flushes"][-1]["createdAt"] = "2020-01-01T00:00:00+09:00"
+        wr(os.path.join(self.root, "private", "flush.json"), box)  # cooldown 통과
+        self.assertEqual(self.flush()[1]["flush"]["status"], "queued")
+        self.assertEqual(len(self.codex_calls()), 1); self.assertEqual(len(lines), 2)
+
+    def test_flush_reregister_ignores_old_queued(self):
+        sock, lines = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
+        self.assertEqual(self.register_self(self.self_env(sid, sock, "tokA")).returncode, 0)
+        first = self.flush()[1]["flush"]
+        self.assertTrue(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(self.flush()[1]["duplicate"], True)  # 같은 등록 안에서는 여전히 중복이다
+        self.assertEqual(self.register_self(self.self_env(sid, sock, "tokB")).returncode, 0)  # 같은 session id, 새 토큰(resume)
+        box = rd(os.path.join(self.root, "private", "flush.json")); box["flushes"][-1]["createdAt"] = "2020-01-01T00:00:00+09:00"
+        wr(os.path.join(self.root, "private", "flush.json"), box)  # 이전 요청을 오래된 것으로 만든다(cooldown 통과, 재등록 전 요청)
+        self.assertFalse(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
+        code, r = self.flush()
+        self.assertEqual((code, r["duplicate"], r["flush"]["status"]), (201, False, "queued"))
+        self.assertNotEqual(r["flush"]["flushId"], first["flushId"])
+
+    def test_flush_self_ambiguous_env_and_explicit_provider(self):
+        sock, _ = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
+        both = {**self.self_env(sid, sock), "CODEX_THREAD_ID": THREAD}
+        self.assertNotEqual(self.register_self(both).returncode, 0)  # 추측하지 않는다
+        self.assertIsNone(self.cli("flush", "status")["registration"])
+
+        def reg_as(provider):
+            return subprocess.run([sys.executable, os.path.join(HERE, "server.py"), "flush", "register", "--self", "--provider", provider],
+                                  env=both, capture_output=True, text=True)
+        out = reg_as("codex")
+        self.assertEqual((out.returncode, json.loads(out.stdout)["registration"]["thread"]), (0, THREAD))
+        out = reg_as("claude")
+        reg = json.loads(out.stdout)["registration"]
+        self.assertEqual((out.returncode, reg["provider"], reg["thread"]), (0, "claude", sid))
+        self.assertNotIn("tok-SECRET", out.stdout)
+        # Claude 변수가 없는데 --provider claude면 실패한다
+        no = subprocess.run([sys.executable, os.path.join(HERE, "server.py"), "flush", "register", "--self", "--provider", "claude"],
+                            env={k: v for k, v in self.env.items() if not k.startswith("CLAUDE_CODE_")}, capture_output=True, text=True)
+        self.assertNotEqual(no.returncode, 0)
+
+    def test_flush_provider_opt_in_is_independent(self):
+        sock, lines = self.fake_claude()
+        sid = "00000000-0000-4000-8000-000000000099"
+        env = self.self_env(sid, sock)
+        for codex_flag, claude_flag, expected in (("0", "0", False), ("1", "0", False), ("0", "1", True)):
+            out = self.register_self({**env, "HQ_ENABLE_CODEX_FLUSH": codex_flag, "HQ_ENABLE_CLAUDE_FLUSH": claude_flag})
+            self.assertEqual(out.returncode == 0, expected, out.stderr)
+        self.env["HQ_ENABLE_CLAUDE_FLUSH"] = "0"
+        self.stop(); self.start()
+        self.assertEqual(self.flush()[1]["flush"]["status"], "failed")
+        self.assertEqual(lines, [])
+        self.assertEqual(self.codex_calls(), [])
 
     def test_flush_rejections(self):
         self.assertEqual(self.flush(origin="http://evil.example")[0], 403)
