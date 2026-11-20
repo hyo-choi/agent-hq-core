@@ -18,7 +18,7 @@ import { Badge } from './components/ui';
 
 const FILTERS = ['q', 'fstatus', 'fcat', 'jq', 'jst', 'gq'];
 // 항목 상세(Det·메시지 원문) 펼침 키. 묶음(Fold·Jira Sprint)과 알림 '더 보기'는 목록 구조이고, Jira의 Sprint 묶음 기준 안내(jsprint)는 항목 상세가 아니라서 '상세 모두 닫기'에서 그대로 둔다
-const DETAIL = /^(d|m|mx|r):/;
+const DETAIL = /^(d|m|mx|r|mdo):/;
 // '상세 모두 닫기' 단축키 Shift+X. 한글 자판에서는 같은 키가 'ㅌ'로 온다. 입력칸·IME 조합·반복·다른 modifier에서는 동작하지 않는다
 const isCloseKey = (e: KeyboardEvent) => {
   const t = e.target as HTMLElement | null;
@@ -43,8 +43,13 @@ export function App() {
     if (s.has(key) === on) return s;
     const n = new Set(s); on ? n.add(key) : n.delete(key); session.set('open', [...n]); return n;
   }), []);
+  const [mdOpen, setMdOpen] = useState(false);
+  useLayoutEffect(() => { setMdOpen(!!document.querySelector('details[data-md-fold][open]')); });
   const closeDetails = useCallback(() => setOpenSet(s => {
-    const n = new Set([...s].filter(k => !DETAIL.test(k))); if (n.size === s.size) return s;
+    const n = new Set([...s].filter(k => !DETAIL.test(k)));
+    // 기본 펼침 본문에는 닫힘 예외를 남겨 새로고침 뒤에도 유지한다.
+    for (const el of document.querySelectorAll<HTMLElement>('[data-md-mark^="mdc:"]')) n.add(el.dataset.mdMark!);
+    if (n.size === s.size && [...n].every(k => s.has(k))) return s;
     session.set('open', [...n]); return n;
   }), []);
   const editSel = useCallback((f: (m: Map<string, string>) => void) => setSel(s => { const n = new Map(s); f(n); session.set('sel', [...n]); return n; }), []);
@@ -117,7 +122,7 @@ export function App() {
   const ctx: AppCtx = { snap, it, pend, refOf, tab, setTab, sel, editSel, isOpen: k => open.has(k), setOpen, filters, setFilters, toast,
     openDialog: node => setDlg({ node, n: Date.now() }), closeDialog: () => dlgRef.current?.close(), reload: load, reveal, revealId, afterRender, alertTick, bumpAlerts, editing, setEditing };
   return <Ctx.Provider value={ctx}>
-    <Body nav={nav} loadErr={loadErr} loadedAt={loadedAt} anyDetail={[...open].some(k => DETAIL.test(k))} closeDetails={closeDetails} />
+    <Body nav={nav} loadErr={loadErr} loadedAt={loadedAt} anyDetail={mdOpen || [...open].some(k => DETAIL.test(k))} closeDetails={closeDetails} />
     <dialog ref={dlgRef} class="modal modal-bottom sm:modal-middle" onClose={() => setDlg(null)}
       onClick={e => { if (e.target === dlgRef.current) dlgRef.current!.close(); }}>{/* 바깥(backdrop)을 누르면 닫는다. Escape는 dialog 기본 동작 */}
       <div class="modal-box max-w-2xl" key={dlg?.n}>{dlg?.node}</div></dialog>

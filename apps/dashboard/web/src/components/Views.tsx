@@ -5,14 +5,13 @@ import { useApp } from '../ctx';
 import { JKEY, JPRI, JST, KIND, ageMin, fmt, jiraUrl, matches, prBadge, resolvedItems } from '../lib/model';
 import type { Item, JiraIssue } from '../lib/types';
 import { PrLinks } from './Lists';
-import { Badge, Det, Empty, GROUP, ListBox, Muted, RefBtn, StatusBadge } from './ui';
+import { Badge, Det, Empty, GROUP, ListBox, Md, Muted, RefBtn, RelBtn, StatusBadge } from './ui';
 
 // ---------- 다음 할 일 추천 (coordinator가 data.recommendations에 명시한 것만) ----------
 export function Recs({ gotoJira }: { gotoJira: (k: string) => void }) {
-  const { snap, it, refOf, revealId } = useApp(), D = snap.data, R = D.recommendations, all = R?.items || [];
-  const shown = [...Object.values(it).flat(), ...resolvedItems(snap)];
-  // 관련 항목: 명시한 내부 id 중 HQ 번호가 있는 것만 버튼으로 둔다. 목록에 없는(숨김·merged) 항목은 누르면 이유만 알린다
-  const related = (r: typeof all[number]) => [...new Set((Array.isArray(r.related) ? r.related : []).filter(id => typeof id === 'string' && refOf(id)))];
+  const { snap } = useApp(), D = snap.data, R = D.recommendations, all = R?.items || [];
+  // 관련 항목: 명시한 내부 id만 버튼으로 둔다
+  const related = (r: typeof all[number]) => [...new Set((Array.isArray(r.related) ? r.related : []).filter(id => typeof id === 'string'))];
   if (!all.length) return <Empty>지금 표시할 추천이 없습니다.</Empty>;
   // merged로 확인된(known merged) PR만 걸린 추천은 이미 끝난 리뷰 행동이므로 카드에서 뺀다. Jira 상태는 바꾸지 않는다.
   const merged = (r: typeof all[number]) => (r.prs || []).length > 0 && r.prs!.every(n => (D.mergedPrs || {})[n]);
@@ -24,14 +23,11 @@ export function Recs({ gotoJira }: { gotoJira: (k: string) => void }) {
       <div class="flex flex-wrap items-center gap-2"><span class="badge badge-sm badge-neutral tabular-nums">{String(i + 1)}</span><RefBtn id={r.id} label={r.title} />
         {r.decision ? <Badge cls="badge-warning">사용자 결정 필요</Badge> : <Badge cls="badge-success">바로 할 수 있음</Badge>}</div>
       <h3 class="card-title text-base leading-snug">{r.title}</h3>
-      {r.why ? <p class="line-clamp-3 text-sm text-base-content/70">{r.why}</p> : null}
-      {r.action ? <p class="text-sm"><b>다음 행동 · </b>{r.action}</p> : null}
-      {r.decision ? <p class="rounded-field bg-warning/15 px-3 py-2 text-sm text-base-content">{r.decision}</p> : null}
+      {r.why ? <Md cls="text-sm text-base-content/70" text={r.why} foldKey={(r.id || r.title) + ":why"} /> : null}
+      {r.action ? <div class="text-sm"><b>다음 행동 · </b><Md text={r.action} foldKey={(r.id || r.title) + ":action"} /></div> : null}
+      {r.decision ? <Md cls="rounded-field bg-warning/15 px-3 py-2 text-sm text-base-content" text={r.decision} foldKey={(r.id || r.title) + ":decision"} /> : null}
       <div class="mt-auto flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-2 text-sm">
-        {related(r).map(id => { const x = shown.find(x => x.id === id), ref = refOf(id);
-          return <button key={id} class="btn btn-xs btn-soft btn-primary" type="button" data-related={id} title={x ? `${KIND[x.kind]} 탭에서 ${ref} 보기` : `${ref}: 지금 진행판 목록에 없음(누르면 이유 안내)`}
-            aria-label={x ? `관련 ${ref} ${KIND[x.kind]} 탭에서 보기: ${x.label}` : `관련 ${ref} 목록에 없음, 이유 보기`} onClick={() => revealId(id)}>
-            <span class="font-mono">{'관련 ' + ref}</span><span class="opacity-70">{x ? KIND[x.kind] + ' 보기' : '목록에 없음'}</span></button>; })}
+        {related(r).map(id => <RelBtn key={id} id={id} />)}
         <PrLinks nums={r.prs} />
         {(r.jira || []).filter(k => JKEY.test(k)).map(k => <span class="inline-flex items-center gap-1">
           <button class="btn btn-xs btn-soft btn-info font-mono" type="button" title="Jira 탭에서 보기" onClick={() => gotoJira(k)}>{k}</button>

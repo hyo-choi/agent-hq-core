@@ -10,3 +10,5 @@ apps/dashboard/public/
 data.json
 private/
 backups/
+# 설치자별 확장 설정과 배포 폴더
+apps/github-extension/local/

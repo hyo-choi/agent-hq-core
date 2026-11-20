@@ -3,13 +3,17 @@ import type { ComponentChildren, JSX } from 'preact';
 import { useLayoutEffect, useRef } from 'preact/hooks';
 import { useApp } from '../ctx';
 import { copyText } from '../lib/api';
-import { mdHtml } from '../lib/md';
-import { BADGE, STATE_NAME, itemGroup, safeUrl } from '../lib/model';
+import { mdHtml, mdSections } from '../lib/md';
+import { BADGE, KIND, STATE_NAME, itemGroup, resolvedItems, safeUrl } from '../lib/model';
 import type { Item } from '../lib/types';
 
 type Kids = { children?: ComponentChildren };
 export const Badge = ({ cls = 'badge-ghost', children, ...rest }: Kids & { cls?: string } & JSX.HTMLAttributes<HTMLSpanElement>) =>
   <span class={'badge badge-sm badge-soft whitespace-nowrap ' + cls} {...rest}>{children}</span>;
+const ActionBadge = ({ count }: { count?: number }) => <Badge cls="badge-primary">
+  <span aria-hidden="true">확인{count === undefined ? '' : ' ' + count}</span>
+  <span class="sr-only">직접 확인할 섹션{count === undefined ? '' : ' ' + count + '개'}</span>
+</Badge>;
 // state가 있으면 묶음 색은 state를 따르고, 취소·종료 등은 상태 문구 옆에 따로 보인다
 export const StatusBadge = ({ x }: { x: Pick<Item, 'status' | 'state'> }) => <>
   <Badge cls={BADGE[itemGroup(x)]}>{x.status}</Badge>{x.state && x.state !== 'open' ? <Badge cls="badge-outline">{STATE_NAME[x.state]}</Badge> : null}</>;
@@ -19,8 +23,33 @@ export const Empty = ({ children }: Kids) =>
 export const A = ({ label, url }: { label: ComponentChildren; url?: string | null }) =>
   safeUrl(url) ? <a class="link link-info" href={url!} target="_blank" rel="noopener noreferrer">{label}</a> : <>{label}</>;
 // 긴 본문 Markdown. div라서 p 안에 두지 않는다. 비어 있으면 그리지 않아 Dl 행 생략 규칙이 그대로다
-export const Md = ({ text, cls = '' }: { text?: string | null; cls?: string }) =>
-  text ? <div class={'md ' + cls} dangerouslySetInnerHTML={{ __html: mdHtml(text) }} /> : null;
+export function Md({ text, cls = '', foldKey }: { text?: string | null; cls?: string; foldKey?: string }) {
+  if (!text) return null;
+  if (!foldKey) return <div class={'md ' + cls} dangerouslySetInnerHTML={{ __html: mdHtml(text) }} />;
+  const { intro, sections } = mdSections(text);
+  return <div class={'md ' + cls}>
+    {intro ? <div dangerouslySetInnerHTML={{ __html: intro }} /> : null}
+    {sections.map(s => <div key={s.key}><MdFold k={foldKey + ':' + s.key} summary={s.title} summaryHtml={s.titleHtml} defOpen={s.open}>
+      <div dangerouslySetInnerHTML={{ __html: s.html }} />
+    </MdFold>{s.after ? <div dangerouslySetInnerHTML={{ __html: s.after }} /> : null}</div>)}
+  </div>;
+}
+// Jira 묶음과 같이 기본값에서 바뀐 상태만 기존 open 목록에 저장한다. 검색의 임시 펼침은 저장하지 않는다.
+// toggle은 렌더 중 또는 지연되어 올 수 있으므로 최신 표시값과 다른 사용자 변경만 저장한다.
+export function MdFold({ k, summary, summaryHtml, defOpen = false, children }: Kids & { k: string; summary: ComponentChildren; summaryHtml?: string; defOpen?: boolean }) {
+  const { isOpen, setOpen, filters, tab } = useApp();
+  const mark = (defOpen ? 'mdc:' : 'mdo:') + k, force = ['work', 'question', 'decision'].includes(tab) && !!filters.q?.trim();
+  const expected = force || (defOpen !== isOpen(mark)), current = useRef({ force, expected });
+  current.current = { force, expected };
+  return <details class="my-2" data-md-fold data-md-mark={mark} open={expected}
+    onToggle={e => { if (e.target === e.currentTarget && !current.current.force && e.currentTarget.open !== current.current.expected) setOpen(mark, e.currentTarget.open !== defOpen); }}>
+    <summary class={'cursor-pointer rounded font-medium ' + (defOpen ? 'text-primary' : 'text-base-content/60')}>
+      <span dangerouslySetInnerHTML={summaryHtml ? { __html: summaryHtml } : undefined}>{summaryHtml ? undefined : summary}</span>
+      {defOpen ? <> <ActionBadge /></> : null}
+    </summary>
+    <div class="mt-2 pl-3">{children}</div>
+  </details>;
+}
 export const ListBox = ({ children }: Kids) => <div class="list rounded-box border border-base-300 bg-base-100 shadow-sm">{children}</div>;
 export const GROUP = 'rounded-box border border-base-300 bg-base-100 shadow-sm';
 export const DlgTitle = ({ children }: Kids) => <h2 class="mb-2 text-lg font-bold">{children}</h2>;
@@ -28,10 +57,15 @@ export const CloseBtn = ({ t = '닫기' }: { t?: string }) => { const { closeDia
 export const ErrAlert = ({ children, cls = '' }: Kids & { cls?: string }) => <p role="alert" class={'alert alert-error alert-soft text-sm ' + cls}>{children}</p>;
 
 // 접는 상세. 펼침은 탭 sessionStorage의 open 키 목록에 남아 갱신·탭 이동·새로고침 뒤에도 유지된다
-export function Det({ k, summary, children }: Kids & { k: string; summary: ComponentChildren }) {
+export function Det({ k, summary, children, force, actionCount = 0 }: Kids & { k: string; summary: ComponentChildren; force?: boolean; actionCount?: number }) {
   const { isOpen, setOpen } = useApp();
-  return <details class="group/det mt-2" open={isOpen(k)} onToggle={e => setOpen(k, e.currentTarget.open)}>
-    <summary class="w-fit cursor-pointer rounded text-sm font-medium text-base-content/60 hover:text-base-content">{summary}</summary>
+  const expected = !!force || isOpen(k), current = useRef({ force, expected });
+  current.current = { force, expected };
+  return <details class="group/det mt-2" open={expected}
+    onToggle={e => { if (e.target === e.currentTarget && !current.current.force && e.currentTarget.open !== current.current.expected) setOpen(k, e.currentTarget.open); }}>
+    <summary class={'w-fit cursor-pointer rounded text-sm font-medium ' + (actionCount ? 'text-primary' : 'text-base-content/60 hover:text-base-content')}>
+      {summary}{actionCount ? <> <ActionBadge count={actionCount} /></> : null}
+    </summary>
     <div class="mt-2 rounded-box bg-base-200 p-4 text-sm leading-relaxed">{children}</div>
   </details>;
 }
@@ -68,6 +102,16 @@ export function RefBtn({ id, label, go }: { id?: string | null; label: string; g
     title={go ? `${r}로 이동` : `${r} 복사`} aria-label={go ? `${r}로 이동: ${label}` : `번호 ${r} 복사: ${label}`}
     onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') e.stopPropagation(); }}
     onClick={async e => { e.preventDefault(); e.stopPropagation(); if (go) return go(); if (await copyText(r)) toast(`${r} 번호를 복사했습니다.`); else openDialog(<ManualCopy text={r} />); }}>{r}</button>;
+}
+
+// 다른 항목으로 이동하는 버튼(추천의 관련 항목, 카드의 원본·파생). HQ 번호가 없는 id는 그리지 않고, 목록에 없는(숨김·merged) 항목은 누르면 이유만 알린다
+export function RelBtn({ id, rel = '관련' }: { id: string; rel?: string }) {
+  const { it, snap, refOf, revealId } = useApp(), ref = refOf(id);
+  if (!ref) return null;
+  const x = [...Object.values(it).flat(), ...resolvedItems(snap)].find(x => x.id === id);
+  return <button class="btn btn-xs btn-soft btn-primary" type="button" data-related={id} title={x ? `${KIND[x.kind]} 탭에서 ${ref} 보기` : `${ref}: 지금 진행판 목록에 없음(누르면 이유 안내)`}
+    aria-label={x ? `${rel} ${ref} ${KIND[x.kind]} 탭에서 보기: ${x.label}` : `${rel} ${ref} 목록에 없음, 이유 보기`} onClick={() => revealId(id)}>
+    <span class="font-mono">{rel + ' ' + ref}</span><span class="opacity-70">{x ? KIND[x.kind] + ' 보기' : '목록에 없음'}</span></button>;
 }
 
 // 묶음 전체 선택. 대상은 지금 화면(검색·필터 결과)에 보이는 항목 중 id가 있고 삭제 요청 대기가 아닌 것만이다.

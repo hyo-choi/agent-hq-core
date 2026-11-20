@@ -47,7 +47,11 @@
     :not(pre) > code { border-radius: 0.25rem; background: color-mix(in oklab, var(--color-base-content) 8%, transparent); padding: 0.1em 0.3em; }
     pre { overflow-x: auto; border-radius: var(--radius-field); border: 1px solid var(--color-base-300); background: var(--color-base-100); padding: 0.5em 0.75em; line-height: 1.5; overflow-wrap: normal; }
     table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 0.9375em; }
-    :is(th, td) { border: 1px solid var(--color-base-300); padding: 0.25em 0.5em; text-align: left; vertical-align: top; overflow-wrap: normal; min-width: 4em; }
+    /* 카드(.list-row)가 물려주는 word-break: break-word는 min-content를 글자 하나로 줄여 좁은 화면에서 열이 찌그러진다. 어절 단위로 되돌려 표가 자기 안에서 가로 스크롤되게 한다 */
+    :is(th, td) { border: 1px solid var(--color-base-300); padding: 0.25em 0.5em; text-align: left; vertical-align: top; word-break: keep-all; overflow-wrap: normal; min-width: 4em; }
+    td.md-long { min-width: 12em; }
+    /* 끊을 곳 없는 URL이 열을 늘리지 않게 링크만 어디서든 끊는다 */
+    :is(th, td) a { overflow-wrap: anywhere; }
     th { background: color-mix(in oklab, var(--color-base-content) 5%, transparent); font-weight: 600; }
   }
 }

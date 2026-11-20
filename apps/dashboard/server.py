@@ -14,7 +14,8 @@
   python3 server.py msg link MSG_ID --item HQ-12|ID [--note]  # coordinator 분류: 메시지를 작업·질문·PR·결정에 연결(원문·kind·itemId 유지)
   python3 server.py msg unlink MSG_ID [--note]                 # 연결 해제(원래 위치로 돌아간다, 기록은 linkHistory에 남는다)
   python3 server.py lookup HQ-12 [w-xxxxxxxx ...]      # 사람용 HQ 번호(또는 내부 id)로 원본 항목과 숨김 여부 조회 (숨긴 항목 포함)
-  python3 server.py flush register --provider codex --thread UUID --evidence TEXT  # '지금 확인 요청' 대상 coordinator thread 명시 등록
+  python3 server.py flush register --self [--evidence TEXT]                        # '지금 확인 요청' 대상으로 이 세션(Claude·Codex)을 자기 등록(이전 등록 교체)
+  python3 server.py flush register --provider codex --thread UUID --evidence TEXT  # Codex thread를 명시 등록(--self를 쓸 수 없을 때)
   python3 server.py flush unregister|status|done --id FLUSH_ID [--note]            # 등록 해제 / 상태 조회 / coordinator 처리 기록
   python3 server.py item add work|question|decision --file F.json [--set K=V] [--reason]   # 새 항목(영속 id·HQ 번호 부여, state 기본 open)
   python3 server.py item get HQ-12|ID                                                   # 원본과 rev 조회(읽기 전용)
@@ -29,7 +30,7 @@
 코드는 Git(apps/dashboard)에, 실행 데이터(public/data.json, private/)는 HQ_DASH_ROOT(기본 ~/.local/share/agent-hq-core)에 둔다.
 외부 연동은 모두 끔이 기본이다: HQ_GITHUB_REPO(PR 조회), HQ_JIRA_PROJECT(Jira 스냅샷), HQ_ENABLE_CODEX_FLUSH=1(Codex 알림), HQ_TASKS_DIR(task 문서 대조).
 """
-import argparse, fcntl, hashlib, json, os, re, secrets, subprocess, sys, tempfile, threading, time
+import argparse, fcntl, hashlib, json, math, os, re, secrets, socket, stat, subprocess, sys, tempfile, threading, time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +42,11 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 ASSETS = os.path.join(HERE, "public")  # index.html·app.css는 코드와 함께 Git에 있다
 PUBLIC = os.path.join(ROOT, "public")
 PRIVATE = os.path.join(ROOT, "private")
+CAPTURES = os.path.join(os.path.realpath(ROOT), "captures")
+CAPTURE_NAME_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}")
+CAPTURE_TYPES = {"html": "text/html; charset=utf-8", "png": "image/png", "jpg": "image/jpeg",
+                 "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif",
+                 "json": "application/json; charset=utf-8"}
 DATA = os.path.join(PUBLIC, "data.json")
 STATE = os.path.join(PRIVATE, "state.json")
 LOCK = os.path.join(PRIVATE, ".lock")
@@ -48,11 +54,25 @@ MESSAGES = os.path.join(PRIVATE, "messages.json")  # 항목별 메시지. 삭제
 SCHEMA = 1
 ACTION = "hide_from_dashboard"
 MAX_BODY = 16 * 1024
+UPLOADS = os.path.join(PRIVATE, "uploads")
+UPLOAD_MAX = 5 * 1024 * 1024
+UPLOAD_COUNT = 6
+UPLOAD_CONCURRENT = 4
+# 5MiB는 1Mbps에서 약 42초 걸린다. 전체 120초로 여유를 두되 20초 무진전 연결은 닫는다.
+TRANSFER_IDLE_TIMEOUT = 20
+TRANSFER_TOTAL_TIMEOUT = 120
+TRANSFER_CHUNK = 16 * 1024
+UPLOAD_TOTAL = 256 * 1024 * 1024
+UPLOAD_KEEP = 14 * 86400
+UPLOAD_ORPHAN_KEEP = 86400
+UPLOAD_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
 MAX_ITEMS = 100
 KST = timezone(timedelta(hours=9))
 # 공통 검증 한계(globalLimits, 문자열 목록)는 섹션 전체가 한 항목이다. id는 data.json의 globalLimitsId(g-xxxxxxxx)에 둔다
 LIMITS_ID_RE = re.compile(r"^g-[0-9a-f]{8}$")
 REQ_RE = re.compile(r"^[0-9a-f]{32}$")
+EXT_ORIGIN_RE = re.compile(r"^chrome-extension://[a-p]{32}$")
+EXT_ROUTES = ("/api/messages", "/api/flush", "/api/uploads")  # 숨김 요청은 허용하지 않는다
 MSG_KINDS = ("work", "question", "pr", "decision")  # 공통 한계·추천·Jira에는 메시지를 남기지 않는다
 # 메시지 숨김 요청의 대상 id. 항목 id(w-·q-·d-·pr-·g-)와 겹치지 않게 접두사와 kind "message"로 구분한다
 MSG_PREFIX = "msg-"
@@ -68,11 +88,12 @@ LISTS = {"work": ("work", "w"), "question": ("questions", "q"), "decision": ("pe
 FLUSH = os.path.join(PRIVATE, "flush.json")  # '지금 확인 요청': 등록된 coordinator thread와 요청 기록
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_BIN = os.environ.get("HQ_CODEX_BIN") or "codex"  # 테스트는 가짜 스크립트로 바꾼다
+CLAUDE_FLUSH = os.environ.get("HQ_ENABLE_CLAUDE_FLUSH") == "1"  # 독립 opt-in. Codex 설정은 이 값을 켜지 않는다
 CODEX_FLUSH = os.environ.get("HQ_ENABLE_CODEX_FLUSH") == "1"  # opt-in. 끄면 등록·전송을 하지 않는다
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 QUEUED_RE = re.compile(r"Queued message ([0-9a-f-]{36}) for thread")
 FLUSH_COOLDOWN = 60    # 마지막 요청 후 이 시간(초) 안에는 새로 보내지 않는다
-FLUSH_TIMEOUT = 15     # codex queue 실행 timeout(초)
+FLUSH_TIMEOUT = 15     # codex queue 실행·Claude socket 연결 timeout(초)
 FLUSH_KEEP = 200       # ponytail: 기록 상한. 넘으면 오래된 것부터 버린다
 # 고정 문구. 들어가는 값은 서버가 만든 flushId뿐이다. 사용자 문자열은 넣지 않는다
 FLUSH_MESSAGE = ("[HQ flush {fid}] 진행판 사용자가 '지금 확인 요청'을 눌렀습니다. 진행판 요청함을 지금 확인하세요"
@@ -362,7 +383,7 @@ def view(data, state):
     with _refresh_lock:
         refresh = {**_refresh, "intervalSec": PR_REFRESH_SEC}
     return {"data": v, "refs": state.get("refs", {}).get("map", {}), "requests": reqs, "hiddenCount": len(hidden), "prRefresh": refresh,
-            "messages": msgs, "flush": flush_public(load_flush()), "serverTime": now()}
+            "messages": [public_message(m) for m in msgs], "flush": flush_public(load_flush()), "serverTime": now()}
 
 
 
@@ -603,6 +624,141 @@ def load_messages():
     return load_json(MESSAGES, {"schemaVersion": SCHEMA, "messages": []})
 
 
+def upload_meta(uid):
+    if not isinstance(uid, str) or not REQ_RE.fullmatch(uid):
+        raise BadRequest(400, "첨부 id는 32자리 hex여야 합니다")
+    try:
+        a = load_json(os.path.join(UPLOADS, uid + ".json"))
+        valid = (isinstance(a, dict) and a.get("id") == uid and isinstance(a.get("key"), str)
+                 and REQ_RE.fullmatch(a["key"]) and isinstance(a.get("sha256"), str)
+                 and re.fullmatch(r"[0-9a-f]{64}", a["sha256"]) and a.get("ext") in UPLOAD_TYPES
+                 and a.get("type") == UPLOAD_TYPES[a["ext"]] and type(a.get("size")) is int
+                 and 0 < a["size"] <= UPLOAD_MAX and type(a.get("created")) in (int, float)
+                 and math.isfinite(a["created"]) and a["created"] >= 0)
+        if not valid:
+            raise ValueError("메타데이터 자료형이나 필수 필드가 잘못됐습니다")
+        return a
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
+        sys.stderr.write(f"[{now()}] invalid upload metadata {uid}: {error}\n")
+        return {}
+
+
+def upload_path(a):
+    return os.path.join(UPLOADS, a["id"] + "." + a["ext"])
+
+
+def upload_exists(a):
+    return os.path.isfile(upload_path(a)) and not os.path.islink(upload_path(a))
+
+
+def attachment_view(m, local=False):
+    out = []
+    for a in m.get("attachments", []):
+        meta = upload_meta(a["id"])
+        available = bool(meta and upload_exists(meta) and time.time() - meta["created"] <= UPLOAD_KEEP)
+        item = {"id": a["id"], "type": a["type"], "size": a["size"], "available": available}
+        if local:
+            item["path"] = os.path.abspath(upload_path(meta)) if available else None
+        out.append(item)
+    return out
+
+
+def public_message(m):
+    return {**m, "attachments": attachment_view(m)} if m.get("attachments") else m
+
+
+def cleanup_error(error):
+    # 정상 업로드를 막지 않고, 운영 로그에서 정리 재시도가 필요한 원인을 확인하게 한다.
+    sys.stderr.write(f"[{now()}] upload cleanup failed: {type(error).__name__}: {error}\n")
+
+
+def cleanup_uploads():
+    # 정리 실패는 저장·기동과 분리한다. 파일 하나가 손상되거나 사라져도 나머지를 계속 정리한다.
+    try:
+        os.makedirs(UPLOADS, mode=0o700, exist_ok=True)
+        os.chmod(UPLOADS, 0o700)
+        linked = {a["id"] for m in load_messages()["messages"] for a in m.get("attachments", [])}
+        names = os.listdir(UPLOADS)
+        # 메타데이터와 잔여 파일을 나누어 열거 순서와 무관하게 처리한다.
+        for name in names:
+            if not re.fullmatch(r"[0-9a-f]{32}\.json", name):
+                continue
+            try:
+                a = upload_meta(name[:-5])
+                if not a:
+                    continue
+                keep = UPLOAD_KEEP if a["id"] in linked else UPLOAD_ORPHAN_KEEP
+                if time.time() - a["created"] > keep:
+                    for path in (upload_path(a), os.path.join(UPLOADS, name)):
+                        try:
+                            os.unlink(path)
+                        except FileNotFoundError:
+                            pass
+            except Exception as error:
+                cleanup_error(error)
+        for name in names:
+            path = os.path.join(UPLOADS, name)
+            try:
+                orphan = re.fullmatch(r"[0-9a-f]{32}\.(png|jpg|webp)", name) and not os.path.exists(os.path.join(UPLOADS, name.split(".")[0] + ".json"))
+                if (name.startswith(".tmp-upload-") or orphan) and time.time() - os.stat(path).st_mtime > UPLOAD_ORPHAN_KEEP:
+                    os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except Exception as error:
+                cleanup_error(error)
+    except Exception as error:
+        cleanup_error(error)
+
+
+def accept_upload(raw, key):
+    if not isinstance(key, str) or not REQ_RE.fullmatch(key):
+        raise BadRequest(400, "X-Upload-Key는 32자리 hex여야 합니다")
+    ext = ("png" if raw.startswith(b"\x89PNG\r\n\x1a\n") else
+           "jpg" if raw.startswith(b"\xff\xd8\xff") else
+           "webp" if len(raw) >= 16 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP" and raw[12:16] in (b"VP8 ", b"VP8L", b"VP8X") else None)
+    if not ext:
+        raise BadRequest(415, "PNG, JPEG, WebP 이미지의 파일 시그니처가 필요합니다")
+    if not 0 < len(raw) <= UPLOAD_MAX:
+        raise BadRequest(413, "이미지는 한 장에 5MiB 이하여야 합니다")
+    digest = hashlib.sha256(raw).hexdigest()
+    with locked():
+        cleanup_uploads()
+        for name in os.listdir(UPLOADS):
+            if re.fullmatch(r"[0-9a-f]{32}\.json", name):
+                a = upload_meta(name[:-5])
+                if a and a["key"] == key:
+                    if a["sha256"] != digest:
+                        raise BadRequest(409, "같은 업로드 키로 다른 파일이 접수됐습니다")
+                    return {k: a[k] for k in ("id", "type", "size")}, True
+        total = sum(os.stat(os.path.join(UPLOADS, name)).st_size for name in os.listdir(UPLOADS))
+        if total + len(raw) + 1024 > UPLOAD_TOTAL:
+            raise BadRequest(507, "이미지 전체 저장 용량(256MiB)이 가득 찼습니다")
+        a = {"id": secrets.token_hex(16), "ext": ext, "type": UPLOAD_TYPES[ext], "size": len(raw),
+             "created": time.time(), "key": key, "sha256": digest}
+        path = upload_path(a)
+        try:
+            with open(path, "xb", opener=lambda p, flags: os.open(p, flags, 0o600)) as f:
+                f.write(raw)
+            # 업로드 메타데이터도 보관 기간이 있는 자료다. 일일 JSON 스냅샷에는 포함하지 않는다.
+            fd, tmp = tempfile.mkstemp(dir=UPLOADS, prefix=".tmp-upload-")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(a, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, os.path.join(UPLOADS, a["id"] + ".json"))
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        except OSError:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
+        return {k: a[k] for k in ("id", "type", "size")}, False
+
+
 def clean_text(t, limit):
     if not isinstance(t, str):
         raise BadRequest(400, "text는 문자열이어야 합니다")
@@ -626,14 +782,27 @@ def accept_message(body):
         raise BadRequest(400, "메시지는 작업·질문·PR·결정 항목이나 자유 메시지(general)로만 남길 수 있습니다")
     if kind == "general" and iid is not None:
         raise BadRequest(400, "자유 메시지에는 itemId를 넣지 않습니다")
-    text = clean_text(body.get("text"), MSG_MAX)
+    aids = body.get("attachments", [])
+    if not isinstance(aids, list) or len(aids) > UPLOAD_COUNT or any(not isinstance(x, str) or not REQ_RE.fullmatch(x) for x in aids) or len(set(aids)) != len(aids):
+        raise BadRequest(400, "첨부는 서로 다른 이미지 id를 최대 6개까지 넣을 수 있습니다")
+    raw_text = body.get("text", "")
+    text = "" if aids and isinstance(raw_text, str) and not raw_text.strip() else clean_text(raw_text, MSG_MAX)
     with locked():
         box = load_messages()
         for m in box["messages"]:
             if m["messageId"] == mid:  # 재시도: 같은 내용이면 기존 기록, 다르면 충돌(같은 키로 다른 글을 덮지 않는다)
-                if (m["kind"], m["itemId"], m["text"]) != (kind, iid, text):
+                if (m["kind"], m["itemId"], m["text"], [a["id"] for a in m.get("attachments", [])]) != (kind, iid, text, aids):
                     raise BadRequest(409, "같은 messageId로 다른 내용이 이미 접수됐습니다")
                 return m, True
+        used = {a["id"] for m in box["messages"] for a in m.get("attachments", [])}
+        if used.intersection(aids):
+            raise BadRequest(409, "이미 다른 메시지에 연결된 이미지입니다. 새로 첨부해 주세요")
+        attachments = []
+        for uid in aids:
+            a = upload_meta(uid)
+            if not a or not upload_exists(a) or time.time() - a["created"] > UPLOAD_KEEP:
+                raise BadRequest(400, "없는 이미지이거나 보관 기간이 지났습니다. 다시 첨부해 주세요")
+            attachments.append({k: a[k] for k in ("id", "type", "size")})
         if kind != "general":  # 자유 메시지는 항목에 연결하지 않는다(itemId·label·ref 모두 null)
             idx = index_items(load_json(DATA))
             if not isinstance(iid, str) or iid not in idx:  # 삭제 요청과 같은 기준: 실제 인덱스
@@ -644,6 +813,8 @@ def accept_message(body):
             raise BadRequest(507, f"메시지가 {MSG_CAP}건을 넘어 더 받을 수 없습니다")
         m = {"messageId": mid, "kind": kind, "itemId": iid, "label": idx[iid][1][:200] if iid else None, "text": text, "createdAt": now(),
              "status": "received", "processedAt": None, "processNote": None, "replies": []}
+        if attachments:
+            m["attachments"] = attachments
         box["messages"].append(m)
         write_json(MESSAGES, box)
         return m, False
@@ -663,7 +834,7 @@ def msg_cli(a):
             ref_of = (a.item or "").upper()
             return {"messages": [{"messageId": m["messageId"], "msgRef": own(m), "ref": refs.get(m["itemId"]), "itemId": m["itemId"], "kind": m["kind"],
                                   "label": m["label"], "status": m["status"], "createdAt": m["createdAt"], "replies": len(m["replies"]),
-                                  "linkRef": link_ref(m), "hidden": MSG_PREFIX + m["messageId"] in hidden, "text": m["text"][:120]}
+                                  "linkRef": link_ref(m), "hidden": MSG_PREFIX + m["messageId"] in hidden, "text": m["text"][:120], "attachments": attachment_view(m, local=True)}
                                  for m in ms if (a.all or m["status"] == "received")
                                  and (not a.item or a.item in (m["itemId"], (m.get("link") or {}).get("id"))
                                       or ref_of == (own(m) or "").upper()
@@ -675,7 +846,7 @@ def msg_cli(a):
         if a.mcmd == "read":
             t, idx = msg_target(m), index_items(load_json(DATA))
             # itemNow: 지금 속한 항목(연결했으면 연결 항목, 자유 메시지는 None)의 현재 상태
-            return {**m, "msgRef": own(m), "ref": refs.get(m["itemId"]), "linkRef": link_ref(m), "hidden": MSG_PREFIX + m["messageId"] in hidden,
+            return {**m, "attachments": attachment_view(m, local=True), "msgRef": own(m), "ref": refs.get(m["itemId"]), "linkRef": link_ref(m), "hidden": MSG_PREFIX + m["messageId"] in hidden,
                     "itemNow": t and {"id": t["id"], "ref": refs.get(t["id"]), "inData": t["id"] in idx,
                                       "label": idx.get(t["id"], (None, None))[1], "hidden": t["id"] in hidden}}
         if a.mcmd in ("link", "unlink"):
@@ -740,11 +911,11 @@ def close_stale_sending(box):
     return changed
 
 
-def deliver_codex(thread, fid):
+def deliver_codex(reg, fid):
     if not CODEX_FLUSH:
         return "failed", None, "HQ_ENABLE_CODEX_FLUSH=1이 아니라 보내지 않았습니다"
     try:
-        r = subprocess.run([CODEX_BIN, "queue", "--thread", thread, "--message", FLUSH_MESSAGE.format(fid=fid, root=ROOT)],
+        r = subprocess.run([CODEX_BIN, "queue", "--thread", reg["thread"], "--message", FLUSH_MESSAGE.format(fid=fid, root=ROOT)],
                            capture_output=True, text=True, timeout=FLUSH_TIMEOUT, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return "failed", None, f"{FLUSH_TIMEOUT}초 timeout(적재 여부 미확인)"
@@ -755,6 +926,40 @@ def deliver_codex(thread, fid):
         return "queued", m.group(1), None
     lines = (r.stderr or r.stdout).strip().splitlines()
     return "failed", None, (lines[-1] if lines else f"exit {r.returncode}")[:300]
+
+
+# 과도기 구현: socket 메시지 형식({"type":"auth","token"}, {"type":"user","message":{...}} 한 줄씩)은 공식 문서에 없고
+# Claude Code 2.1.328 바이너리와 격리 실험의 관찰에 근거한다. 공식 문서가 보장하는 것은 inbox socket과 세션 토큰 인증까지다.
+# 버전을 올린 뒤 첫 사용에서 다시 확인해야 하며, 공식 전달 CLI·API가 생기면 이 경로를 그쪽으로 교체한다.
+# 한계: socket은 응답이 없어(ack 없음) 전달·보류·거절을 송신자가 알 수 없다. 세션이 끝난 뒤 같은 pid를 받은 다른 세션이 같은
+# socket 경로를 쓰면 그 세션이 고정 알림을 받을 수 있다(PID 재사용 방어용 내부 레지스트리 파일은 읽지 않기로 했다).
+# 반대로 bypass 세션에서는 토큰이 다르면 전달되지 않고 승인 대화상자로 보류된다. 토큰은 프로세스마다 바뀌므로 resume하면 재등록이 필요하다.
+def deliver_claude(reg, fid):
+    if not CLAUDE_FLUSH:
+        return "failed", None, "HQ_ENABLE_CLAUDE_FLUSH=1이 아니라 보내지 않았습니다"
+    auth = json.dumps({"type": "auth", "token": reg["claude"]["token"]})
+    msg = json.dumps({"type": "user", "message": {"role": "user", "content": FLUSH_MESSAGE.format(fid=fid, root=ROOT)}})
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(FLUSH_TIMEOUT); s.connect(reg["claude"]["socket"])
+            s.sendall((auth + "\n" + msg + "\n").encode())
+    except FileNotFoundError:
+        return "failed", None, "등록된 Claude 세션이 종료되었습니다(세션에서 다시 등록해야 합니다)"
+    except OSError as e:
+        return "failed", None, f"Claude 세션에 연결하지 못했습니다: {e.__class__.__name__}"
+    return "queued", None, None  # ack가 없어 socket에 썼다는 것까지만 안다
+
+
+DELIVER = {"codex": deliver_codex, "claude": deliver_claude}
+
+
+def flush_is_open(f, reg):
+    if not reg or f["status"] not in ("sending", "queued") or f["thread"] != reg["thread"]:
+        return False
+    if reg.get("generation"):
+        return f.get("generation") == reg["generation"]
+    # 이전 버전의 등록은 기존 대기 요청을 보존한다. 다음 명시 등록부터 임의 세대 ID로 구분한다.
+    return not f.get("generation") and f["createdAt"] >= reg["registeredAt"]
 
 
 def accept_flush(body):
@@ -768,13 +973,14 @@ def accept_flush(body):
             if f["flushId"] == fid:  # 같은 요청 재전송
                 return f, True
         reg = box["registration"]
-        if reg:  # 같은 thread에 coordinator가 처리 기록(done)을 남기지 않은 요청이 있으면 다시 쌓지 않는다
+        if reg:  # 같은 thread에 coordinator가 처리 기록(done)을 남기지 않은 요청이 있으면 다시 쌓지 않는다. 재등록 전(옛 토큰·socket)에 보낸 요청은 열린 요청으로 보지 않는다
             for f in reversed(box["flushes"]):
-                if f["status"] in ("sending", "queued") and f["thread"] == reg["thread"]:
+                if flush_is_open(f, reg):
                     return f, True
         if box["flushes"] and (wait := FLUSH_COOLDOWN - age_sec(box["flushes"][-1]["createdAt"])) > 0:
             raise BadRequest(429, f"{int(wait) + 1}초 후에 다시 요청할 수 있습니다")
         f = {"flushId": fid, "createdAt": now(), "provider": reg and reg["provider"], "thread": reg and reg["thread"],
+             "generation": reg and reg.get("generation"),
              "threadName": reg and reg["threadName"], "status": "sending" if reg else "not_registered",
              "error": None if reg else "등록된 coordinator thread가 없습니다", "queueMessageId": None, "sentAt": None,
              "processedAt": None, "processNote": None}
@@ -782,7 +988,7 @@ def accept_flush(body):
         write_json(FLUSH, box)
     if not reg:
         return f, False
-    status, qid, err = deliver_codex(reg["thread"], fid)  # 락 밖에서 실행한다(최대 FLUSH_TIMEOUT초)
+    status, qid, err = DELIVER[reg["provider"]](reg, fid)  # 락 밖에서 실행한다(최대 FLUSH_TIMEOUT초)
     with locked():
         box = load_flush()
         f = next(x for x in box["flushes"] if x["flushId"] == fid)
@@ -794,8 +1000,35 @@ def accept_flush(body):
 def flush_public(box):
     reg = box["registration"]
     return {"registration": reg and {k: reg[k] for k in ("provider", "threadName", "registeredAt")},
-            "recent": [{k: v for k, v in f.items() if k not in ("thread", "queueMessageId")} for f in box["flushes"][-5:]],
+            "recent": [{**{k: v for k, v in f.items() if k not in ("thread", "queueMessageId", "generation")},
+                        "active": flush_is_open(f, reg)} for f in box["flushes"][-5:]],
             "cooldownSec": FLUSH_COOLDOWN}
+
+
+def self_identity(provider=None):
+    """--self: 이 프로세스의 환경변수로 등록할 세션을 정한다. (provider, thread, 이름, 등록에 더할 필드)를 돌려준다.
+    token은 환경변수에서만 읽는다(argv로 받으면 ps에 보인다). provider를 주지 않았는데 Claude·Codex 변수가 함께 있으면
+    (예: Claude에서 띄운 Codex가 변수를 상속) 추측하지 않고 종료한다. 판정 근거가 없으면 종료한다."""
+    env = os.environ
+    sid, sock, token = (env.get(k) for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"))
+    tid = env.get("CODEX_THREAD_ID")
+    if provider is None and (sid or sock or token) and tid:
+        sys.exit("Claude와 Codex 환경변수가 함께 있어 판정할 수 없습니다. --self --provider claude|codex로 지정하세요")
+    if provider == "claude" or (provider is None and (sid or sock or token)):
+        if not (sid and sock and token):
+            sys.exit("Claude 세션 환경변수(CLAUDE_CODE_SESSION_ID·MESSAGING_SOCKET·MESSAGING_TOKEN)가 일부만 있습니다")
+        if not UUID_RE.match(sid):
+            sys.exit("CLAUDE_CODE_SESSION_ID가 UUID 형식이 아닙니다")
+        try:
+            st = os.stat(sock)
+        except OSError:
+            sys.exit("Claude inbox socket이 없습니다")
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            sys.exit("Claude inbox socket이 현재 사용자의 Unix socket이 아닙니다")
+        return "claude", sid, f"claude-{sid[:8]}", {"claude": {"socket": sock, "token": token}}
+    if tid:
+        return "codex", tid, codex_thread_name(tid) if UUID_RE.match(tid) else None, {}
+    sys.exit("자기 세션을 판정할 환경변수가 없습니다. Codex면 --provider codex --thread UUID로 등록하세요")
 
 
 def flush_cli(a):
@@ -803,16 +1036,27 @@ def flush_cli(a):
         box = load_flush()
         changed = close_stale_sending(box)
         if a.fcmd == "register":
-            if not CODEX_FLUSH:
-                sys.exit("Codex 알림은 opt-in입니다. HQ_ENABLE_CODEX_FLUSH=1로 실행하세요")
-            if not UUID_RE.match(a.thread):
-                sys.exit("thread는 Codex session UUID여야 합니다")
-            name = codex_thread_name(a.thread)
+            if a.self_:
+                provider, thread, name, extra = self_identity(a.provider)
+            elif a.provider == "codex" and a.thread:
+                provider, thread, extra = a.provider, a.thread, {}
+                name = codex_thread_name(thread) if UUID_RE.match(thread) else None
+            else:
+                sys.exit("--self 또는 --provider codex와 --thread가 필요합니다(Claude는 --self로만 등록합니다)")
+            enabled = CODEX_FLUSH if provider == "codex" else CLAUDE_FLUSH
+            if not enabled:
+                sys.exit(f"{provider} 알림은 opt-in입니다. HQ_ENABLE_{provider.upper()}_FLUSH=1로 실행하세요")
+            if not UUID_RE.match(thread):
+                sys.exit("thread는 session UUID여야 합니다")
             if name is None:
                 sys.exit(f"{CODEX_HOME}/session_index.jsonl에 없는 thread입니다")
+            if not (a.evidence or a.self_):
+                sys.exit("--evidence가 필요합니다")
             prev = box["registration"]
-            box["registration"] = {"provider": a.provider, "thread": a.thread, "threadName": name, "registeredAt": now(),
-                                   "evidence": a.evidence, "previousThread": prev and prev["thread"]}
+            box["registration"] = {"provider": provider, "thread": thread, "threadName": name, "registeredAt": now(),
+                                   "generation": secrets.token_hex(16),
+                                   "evidence": a.evidence or "세션 자기 등록(--self)", **extra,
+                                   "previous": prev and {"provider": prev["provider"], "thread": prev["thread"]}}
             changed = True
         elif a.fcmd == "unregister":
             changed, box["registration"] = box["registration"] is not None, None
@@ -824,29 +1068,64 @@ def flush_cli(a):
                 f.update(status="processed", processedAt=now(), processNote=a.note or None); changed = True
         if changed:
             write_json(FLUSH, box)
-    return {"registration": box["registration"], "flushes": box["flushes"][-10:]}
+    reg = box["registration"]  # 출력에는 Claude 세션 토큰·socket 경로를 내보내지 않는다
+    return {"registration": reg and {k: v for k, v in reg.items() if k not in ("claude", "generation")},
+            "flushes": [{k: v for k, v in f.items() if k != "generation"} for f in box["flushes"][-10:]]}
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "AgentHQ/2"
     sys_version = ""
 
-    def send_body(self, code, body, ctype="application/json; charset=utf-8"):
+    def send_body(self, code, body, ctype="application/json; charset=utf-8", capture=False, upload=False):
         if not isinstance(body, bytes):
             body = json.dumps(body, ensure_ascii=False).encode()
+        self.connection.settimeout(TRANSFER_IDLE_TIMEOUT)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "private, no-store" if upload else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-                         "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-        self.end_headers()
-        self.wfile.write(body)
+        self.send_header("Content-Security-Policy", "sandbox" if upload else "sandbox allow-scripts" if capture else
+                         "default-src 'none'; script-src 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                         "connect-src 'self'; img-src 'self' data: blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        try:
+            deadline = time.monotonic() + TRANSFER_TOTAL_TIMEOUT
+            self.end_headers()
+            remaining = memoryview(body)
+            while remaining:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("response deadline exceeded")
+                self.connection.settimeout(min(TRANSFER_IDLE_TIMEOUT, left))
+                # sendall 대신 작은 send의 실제 진전마다 유휴 시간을 다시 잰다.
+                sent = self.connection.send(remaining[:TRANSFER_CHUNK])
+                if not sent:
+                    raise ConnectionError("response connection closed")
+                remaining = remaining[sent:]
+        except OSError as error:
+            self.close_connection = True
+            self.log_message("response write failed: %s", error)
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if path.startswith("/api/uploads/"):
+            content = None
+            try:
+                with locked():
+                    a = upload_meta(path[len("/api/uploads/"):])
+                    if a and upload_exists(a) and time.time() - a["created"] <= UPLOAD_KEEP:
+                        with open(upload_path(a), "rb") as f:
+                            content = f.read(UPLOAD_MAX)
+            except (BadRequest, OSError):
+                pass
+            # 느린 클라이언트의 네트워크 전송은 전역 데이터 잠금을 점유하지 않는다.
+            if content is not None:
+                return self.send_body(200, content, a["type"], upload=True)
+            return self.send_body(404, {"error": "보관 기간이 지나 삭제됐거나 없는 이미지입니다"}, upload=True)
+        if path.startswith("/captures/"):
+            return self.send_capture(path)
         if path in STATIC:  # ponytail: 정확한 경로 allowlist라 경로 탈출 여지가 없다
             name, ctype = STATIC[path]
             with open(os.path.join(ASSETS, name), "rb") as f:
@@ -867,46 +1146,113 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_body(200, view(data, state))
         self.send_body(404, {"error": "not found"})
 
+    def send_capture(self, path):
+        # URL을 디코딩하지 않아 인코딩된 구분자·점도 허용 목록에서 거절한다.
+        parts = path[len("/captures/"):].split("/")
+        if len(parts) == 2 and CAPTURE_NAME_RE.fullmatch(parts[0]):
+            folder, name = parts[0], parts[1] or "index.html"
+            if CAPTURE_NAME_RE.fullmatch(name):
+                ctype = CAPTURE_TYPES.get(name.rsplit(".", 1)[-1]) if "." in name else None
+                resolved = os.path.realpath(os.path.join(CAPTURES, folder, name))
+                # captures 자체나 내부 심볼릭 링크가 다른 실행 데이터를 가리켜도 노출하지 않는다.
+                if ctype and os.path.commonpath((CAPTURES, resolved)) == CAPTURES and os.path.isfile(resolved):
+                    try:
+                        with open(resolved, "rb") as f:
+                            if stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                                return self.send_body(200, f.read(), ctype, capture=True)
+                    except OSError:
+                        pass
+        return self.send_body(404, {"error": "not found"}, capture=True)
+
+
     def do_POST(self):
         accept = {"/api/requests": accept_request, "/api/messages": accept_message, "/api/flush": accept_flush}.get(self.path)
-        if not accept:
+        is_upload = self.path == "/api/uploads"
+        if not accept and not is_upload:
             return self.send_body(404, {"error": "not found"})
-        origin = self.headers.get("Origin")
-        if origin not in self.server.origins or self.headers.get("Sec-Fetch-Site", "same-origin") != "same-origin":
+        origins = self.headers.get_all("Origin", [])
+        if len(origins) != 1:
+            return self.send_body(403, {"error": "Origin 헤더는 정확히 하나여야 합니다"})
+        origin = origins[0]
+        # 브라우저 Origin 경계이며 비브라우저 클라이언트의 인증 수단은 아니다.
+        from_ext = origin in self.server.ext_origins and self.path in EXT_ROUTES
+        if not from_ext and (origin not in self.server.origins or self.headers.get("Sec-Fetch-Site", "same-origin") != "same-origin"):
             return self.send_body(403, {"error": "같은 origin 요청만 허용됩니다"})
-        if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
+        if not is_upload and (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
             return self.send_body(415, {"error": "Content-Type: application/json이 필요합니다"})
+        if self.headers.get_all("Transfer-Encoding"):
+            return self.send_body(400, {"error": "Transfer-Encoding은 지원하지 않습니다"})
+        if len(self.headers.get_all("Content-Length", [])) > 1:
+            return self.send_body(400, {"error": "Content-Length는 하나만 필요합니다"})
         try:
             n = int(self.headers.get("Content-Length") or -1)
         except ValueError:
             n = -1
-        if not 0 < n <= MAX_BODY:
-            return self.send_body(413, {"error": f"본문은 1~{MAX_BODY} byte여야 합니다"})
+        limit = UPLOAD_MAX if is_upload else MAX_BODY
+        if not 0 < n <= limit:
+            return self.send_body(413, {"error": f"본문은 1~{limit} byte여야 합니다"})
+        if is_upload:
+            key = self.headers.get("X-Upload-Key", "")
+            if not REQ_RE.fullmatch(key):
+                return self.send_body(400, {"error": "X-Upload-Key는 32자리 hex여야 합니다"})
+            if not self.server.upload_slots.acquire(blocking=False):
+                return self.send_body(503, {"error": "이미지 업로드가 진행 중입니다. 잠시 뒤 다시 보내 주세요"})
         try:
-            body = json.loads(self.rfile.read(n).decode("utf-8"))
-            req, dup = accept(body)
+            # 작은 청크의 진전은 유휴 제한을 갱신하지만 전체 마감은 연장하지 않는다.
+            deadline, raw, remaining = time.monotonic() + TRANSFER_TOTAL_TIMEOUT, bytearray(), n
+            while remaining:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("request body deadline exceeded")
+                self.connection.settimeout(min(TRANSFER_IDLE_TIMEOUT, left))
+                chunk = self.rfile.read1(min(remaining, TRANSFER_CHUNK))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                remaining -= len(chunk)
+            if len(raw) != n:
+                raise BadRequest(400, "본문 길이가 Content-Length와 다릅니다")
+            if is_upload:
+                req, dup = accept_upload(raw, self.headers.get("X-Upload-Key"))
+            else:
+                body = json.loads(raw.decode("utf-8"))
+                req, dup = accept(body)
         except BadRequest as e:
             return self.send_body(e.code, {"error": str(e)})
         except (ValueError, UnicodeDecodeError):
             return self.send_body(400, {"error": "JSON 형식 오류"})
+        except TimeoutError:
+            return self.send_body(408, {"error": "본문 전송이 오래 멈췄거나 전체 제한 시간을 넘었습니다"})
         except OSError:
             return self.send_body(500, {"error": "저장하지 못했습니다"})
-        key = {accept_request: "request", accept_message: "message", accept_flush: "flush"}[accept]
-        if accept is accept_flush:  # 등록 thread UUID와 queue 내부 id는 응답에 넣지 않는다
-            req = {k: v for k, v in req.items() if k not in ("thread", "queueMessageId")}
+        finally:
+            if is_upload:
+                self.server.upload_slots.release()
+        key = "upload" if is_upload else {accept_request: "request", accept_message: "message", accept_flush: "flush"}[accept]
+        if accept is accept_flush:  # 등록 세션 id와 queue 내부 id는 응답에 넣지 않는다
+            req = {k: v for k, v in req.items() if k not in ("thread", "queueMessageId", "generation")}
+        if accept is accept_message:
+            req = public_message(req)
         self.send_body(200 if dup else 201, {key: req, "duplicate": dup})
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s [%s] %s\n" % (self.address_string(), now(), fmt % args))
 
 
-def serve(host, port, aliases=()):
+def serve(host, port, aliases=(), ext_origins=()):
+    for origin in ext_origins:
+        if not EXT_ORIGIN_RE.fullmatch(origin):
+            sys.exit(f"--ext-origin 형식 오류: {origin}")
     if not host.startswith("100.") and host != "127.0.0.1":
         sys.exit("127.0.0.1(기본) 또는 tailnet IP(100.x)에만 bind합니다")
     missing = [k for k, (key, _) in LISTS.items() for o in load_json(DATA).get(key) or [] if not o.get("id")]
     if missing:
         print(f"경고: id 없는 항목 {len(missing)}개는 선택할 수 없습니다. `python3 server.py migrate-ids`를 실행하세요.", file=sys.stderr)
+    with locked():
+        cleanup_uploads()
     httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd.ext_origins = set(ext_origins)
+    httpd.upload_slots = threading.BoundedSemaphore(UPLOAD_CONCURRENT)
     # ponytail: 고정 allowlist다. Host 헤더에서 origin을 만들지 않으므로 임의 Host로 우회할 수 없다
     httpd.origins = {f"http://{h}:{port}" for h in (host, *aliases)}
     print(f"serving {' '.join(sorted(httpd.origins))} (root={ROOT})", flush=True)
@@ -1055,9 +1401,9 @@ CATEGORIES = ("PR·코드", "에이전트 운영", "진행 보고·알림", "기
 REQUIRED = {"work": ("title", "status"), "question": ("q", "status"), "decision": ("title",)}
 DONE_FIELD = {"work": "conclusion", "question": "answer"}  # state done이면 비어 있으면 안 된다
 # set으로 바꿀 수 있는 키. add는 여기에 REQUIRED 키를 더한다. id·history·rev·updatedAt·updatedBy는 CLI만 쓴다
-PATCH_KEYS = {"work": ("status", "state", "conclusion", "verification", "remaining", "evidence", "prs"),
-              "question": ("status", "state", "answer", "evidence", "category", "thread", "prs"),
-              "decision": ("detail", "waiting", "evidence", "prs")}
+PATCH_KEYS = {"work": ("status", "state", "conclusion", "verification", "remaining", "evidence", "prs", "derivedFrom"),
+              "question": ("status", "state", "answer", "evidence", "category", "thread", "prs", "derivedFrom"),
+              "decision": ("detail", "waiting", "evidence", "prs", "derivedFrom")}
 FIELD_MAX = 4000
 SOURCE_RE = re.compile(r"^(HQ-[1-9][0-9]{0,6}|chat:\d{4}-\d{2}-\d{2})$")
 
@@ -1109,6 +1455,27 @@ def clean_fields(kind, fields, allowed):
             sys.exit(f"{k}: {e}")
         out[k] = v
     return out
+
+
+def link_origin(data, refs, fields, o=None):
+    """derivedFrom(HQ-n 또는 내부 id)을 실재하는 원본의 내부 id로 바꾼다. 빈 값은 연결 해제다. 자기 연결·순환은 거절한다.
+    이동용 연결일 뿐 부모자식·승인·상태 전파 의미가 없다. 역방향은 저장하지 않고 원본 쪽에서 계산한다."""
+    v, iid = fields.get("derivedFrom"), o and o["id"]
+    if not v:
+        if not (o or {}).get("derivedFrom"):  # 해제할 연결이 없으면 변경이 아니다
+            fields.pop("derivedFrom", None)
+        return
+    cur = resolve_key(v, refs)
+    if not (cur and find_item(data, cur)):
+        sys.exit(f"derivedFrom 대상 {v} 없음 (작업·질문·결정만 연결한다)")
+    fields["derivedFrom"] = cur
+    seen = set()
+    while cur and cur not in seen:
+        if cur == iid:
+            sys.exit(f"derivedFrom {v}: 자기 자신이나 자기에게서 파생된 항목에는 연결할 수 없습니다")
+        seen.add(cur)
+        hit = find_item(data, cur)
+        cur = hit and data[hit[1]][hit[2]].get("derivedFrom")
 
 
 def read_fields(a):
@@ -1179,6 +1546,7 @@ def item_cli(a):
             if a.kind != "decision":
                 fields.setdefault("state", "open")
             check_item(a.kind, fields, a.reason)
+            link_origin(data, refs, fields)
             # 지금 data의 id와, 지워진 항목까지 남아 있는 refs.map의 id 모두와 겹치지 않게 한다(옛 번호·숨김·메시지 연결이 따라붙지 않게)
             taken = {o.get("id") for k in (*[v[0] for v in LISTS.values()], "resolvedDecisions") for o in data.get(k) or [] if isinstance(o, dict)} | set(refs)
             iid = next(i for i in iter(lambda: f"{prefix}-{secrets.token_hex(4)}", None) if i not in taken)
@@ -1197,7 +1565,10 @@ def item_cli(a):
         kind, key, i = hit
         o = data[key][i]
         if a.icmd == "get":
-            return item_out(kind, o, refs, hidden, key == "resolvedDecisions")
+            kids = [x["id"] for k in (*[v[0] for v in LISTS.values()], "resolvedDecisions") for x in data.get(k) or []
+                    if isinstance(x, dict) and x.get("derivedFrom") == iid]
+            return {**item_out(kind, o, refs, hidden, key == "resolvedDecisions"),
+                    "derivedItems": [{"id": x, "ref": refs.get(x), "hidden": x in hidden} for x in kids]}
         if key == "resolvedDecisions":
             sys.exit(f"{a.id}는 이미 해소된 결정입니다(읽기 전용)")
         if a.expect_rev is not None and int(o.get("rev") or 0) != a.expect_rev:
@@ -1206,6 +1577,7 @@ def item_cli(a):
             fields = clean_fields(kind, read_fields(a), PATCH_KEYS[kind])
             if not fields:
                 sys.exit("바꿀 필드가 없습니다(--file 또는 --set)")
+            link_origin(data, refs, fields, o)
             new = {**o, **fields}
             check_item(kind, new, a.reason)
             change = describe(o, new)
@@ -1276,6 +1648,8 @@ def check():
             seen[iid] = key
             if iid not in m:
                 old("ref-missing", iid)  # 다음 화면 조회·migrate-ids 때 부여된다
+            if o.get("derivedFrom") and not find_item(data, o["derivedFrom"]):
+                add(warnings, "relation-target-missing", iid, f"derivedFrom 대상 {o['derivedFrom']}이 data에 없습니다")
             for f in REQUIRED[kind]:
                 if not (isinstance(o.get(f), str) and o[f].strip()):
                     add(errors, "field-missing", iid, f"필수 필드 {f}가 없습니다")
@@ -1301,7 +1675,7 @@ def check():
             if g != "done" and ps and all(p and p.get("ok") is True and p.get("state") in ("MERGED", "CLOSED") for p in ps):
                 add(warnings, "open-but-prs-finished", iid, f"연결 PR {', '.join(pr_text(prs, n) for n in o['prs'])}이 모두 끝났는데 {now_st}는 미완료입니다(merged가 곧 업무 종료는 아님)")
             if g == "decide":
-                blob = json.dumps(o, ensure_ascii=False)
+                blob = json.dumps({k: v for k, v in o.items() if k != "derivedFrom"}, ensure_ascii=False)  # 파생 연결은 해소된 결정 언급이 아니다
                 hit = [d for d in resolved if d in blob or (m.get(d) and re.search(rf"\b{m[d]}\b", blob))]
                 if hit:
                     add(warnings, "waiting-on-resolved-decision", iid, f"이미 해소된 결정 {', '.join(m.get(d) or d for d in hit)}을 언급하는데 {now_st}는 결정 대기입니다")
@@ -1426,6 +1800,7 @@ def main(argv=None):
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=48173)
     s.add_argument("--alias", nargs="*", default=[], help="같은 서버를 가리키는 추가 hostname(Origin 허용, 예: localhost)")
     sub.add_parser("init", help="데이터 루트에 빈 data.json(--demo면 합성 예시)을 만든다").add_argument("--demo", action="store_true")
+    s.add_argument("--ext-origin", action="append", default=[], help="메시지·이미지 업로드·flush POST를 허용할 exact 확장 origin. 기본 없음")
     sub.add_parser("migrate-ids")
     s = sub.add_parser("list"); s.add_argument("--all", action="store_true")
     s = sub.add_parser("process-inbox"); s.add_argument("--request", nargs="*")
@@ -1443,10 +1818,11 @@ def main(argv=None):
     m = ms.add_parser("link", help="메시지를 작업·질문·PR·결정에 분류 연결"); m.add_argument("id"); m.add_argument("--item", required=True, help="HQ-12 또는 내부 id")
     m.add_argument("--note")
     m = ms.add_parser("unlink"); m.add_argument("id"); m.add_argument("--note")
-    s = sub.add_parser("flush", help="'지금 확인 요청' 대상 coordinator thread 등록과 요청 기록")
+    s = sub.add_parser("flush", help="'지금 확인 요청' 대상 coordinator 세션 등록과 요청 기록")
     fs = s.add_subparsers(dest="fcmd", required=True)
-    f = fs.add_parser("register"); f.add_argument("--provider", choices=["codex"], required=True)
-    f.add_argument("--thread", required=True, help="Codex session UUID"); f.add_argument("--evidence", required=True, help="이 대화의 thread라고 확인한 근거")
+    f = fs.add_parser("register"); f.add_argument("--self", dest="self_", action="store_true", help="자기 환경변수로 provider(Claude·Codex)를 판정해 이 세션을 등록")
+    f.add_argument("--provider", choices=["codex", "claude"], help="--thread와 함께: Codex 명시 등록. --self와 함께: 그 provider의 자기 환경변수로 등록(Claude·Codex 변수가 함께 있을 때)")
+    f.add_argument("--thread", help="Codex session UUID"); f.add_argument("--evidence", help="이 대화의 thread라고 확인한 근거(--self이면 생략 가능)")
     fs.add_parser("unregister"); fs.add_parser("status")
     f = fs.add_parser("done"); f.add_argument("--id", required=True); f.add_argument("--note")
     s = sub.add_parser("item", help="업무·질문·결정 항목 추가·조회·수정·결정 해소(data.json의 유일한 쓰기 경로)")
@@ -1476,7 +1852,7 @@ def main(argv=None):
     if a.cmd not in ("restore",) and not os.path.isfile(DATA):  # 없는 루트를 조용히 만들지 않는다
         sys.exit(f"데이터가 없습니다: {DATA}\n먼저 `python3 server.py init`(빈 상태) 또는 `init --demo`(합성 예시)를 실행하세요")
     if a.cmd == "serve":
-        return serve(a.host, a.port, a.alias)
+        return serve(a.host, a.port, a.alias, a.ext_origin)
     if a.cmd == "migrate-ids":
         out = migrate_ids()
     elif a.cmd == "list":

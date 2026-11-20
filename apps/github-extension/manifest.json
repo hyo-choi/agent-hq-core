@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Agent HQ 요청",
+  "version": "1.0.0",
+  "description": "GitHub PR과 선택한 Jira 티켓에서 로컬 진행판으로 요청을 보냅니다.",
+  "action": {
+    "default_title": "Agent HQ로 보내기",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "sw.js",
+    "type": "module"
+  },
+  "permissions": [
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [],
+  "content_scripts": []
+}

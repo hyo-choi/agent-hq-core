@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Agent HQ 요청</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fff; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0;
+    --accent: #0969da; --accent-fg: #fff; --err: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16181c; --fg: #e6e8eb; --muted: #a0a8b2; --line: #3a3f46; --accent: #4493f8; --accent-fg: #0b0d10; --err: #ff8a7a; }
+  }
+  * { box-sizing: border-box; }
+  body { width: 380px; margin: 0; padding: 12px; background: var(--bg); color: var(--fg); font: 13px/1.45 system-ui, sans-serif; }
+  h1 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+  label { display: block; margin-top: 10px; font-weight: 600; }
+  select, textarea { width: 100%; margin-top: 4px; padding: 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  textarea { height: 120px; resize: vertical; }
+  button { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--fg); font: inherit; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
+  a { color: var(--accent); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 8px; }
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .check { display: flex; gap: 6px; align-items: center; font-weight: 400; }
+  .check input { margin: 0; }
+  #comment { margin-top: 10px; padding: 6px 8px; border-left: 3px solid var(--line); }
+  #quote { margin: 4px 0 0; max-height: 96px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.4 system-ui, sans-serif; color: var(--muted); }
+  .attach-row { display: flex; align-items: center; gap: 4px; }
+  #attachHelp { width: 28px; height: 28px; padding: 0; border-radius: 50%; color: var(--muted); }
+  #attachHint { position: fixed; inset: auto; margin: 0; padding: 8px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); box-shadow: 0 4px 12px #0003; font: 12px/1.45 system-ui, sans-serif; }
+  #images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  #images > div { width: 96px; overflow-wrap: anywhere; }
+  #images img { width: 96px; height: 80px; object-fit: contain; }
+  #status { margin-top: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #status.err { color: var(--err); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+  <h1 id="title">확인 중…</h1>
+  <div id="sub" class="muted"></div>
+  <form id="form" hidden>
+    <div id="comment" hidden>
+      <div class="muted">댓글 대상: <span id="commentAuthor"></span> · <a id="commentLink" target="_blank" rel="noopener"></a></div>
+      <pre id="quote"></pre>
+    </div>
+    <label for="target">보낼 곳</label>
+    <select id="target"></select>
+    <div id="note" class="muted"></div>
+    <label for="text">내용</label>
+    <textarea id="text" placeholder="질문이나 요청을 적어 주세요"></textarea>
+    <div id="images"></div>
+    <input id="picker" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden aria-label="이미지 파일 선택">
+    <div class="attach-row">
+      <button id="attach" type="button">이미지 첨부</button>
+      <button id="attachHelp" type="button" aria-label="이미지 첨부 안내" aria-expanded="false" aria-controls="attachHint"><span aria-hidden="true">?</span></button>
+    </div>
+    <div id="attachHint" popover="manual">붙여 넣기·파일 선택 · PNG/JPEG/WebP · 장당 5MiB, 최대 6장. 이미지는 popup을 닫으면 사라집니다. 응답 유실 후에는 닫기 전에 그대로 재시도하거나 진행판에서 접수 여부를 확인해 주세요.</div>
+    <div class="row">
+      <span class="btns"><button type="button" id="rebase">리베이스 문구 넣기</button> <button type="button" id="review">리뷰 처리 문구 넣기</button></span>
+      <span id="count" class="muted"></span>
+    </div>
+    <div id="rebaseNote" class="muted"></div>
+    <label class="check"><input type="checkbox" id="flush"> <span id="flushLabel">지금 확인 요청도 보내기</span></label>
+    <div class="row">
+      <a id="dash" target="_blank" rel="noopener">진행판 열기</a>
+      <button type="submit" id="send" class="primary">보내기</button>
+    </div>
+  </form>
+  <div id="status" role="status" aria-live="polite"></div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

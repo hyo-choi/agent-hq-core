@@ -5,7 +5,7 @@ gh는 PATH 앞의 가짜 스크립트로 바꿔서 실제 GitHub을 조회하거
   python3 test_server.py
 """
 import hashlib, json, os, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, unittest
-import urllib.request, urllib.error
+import urllib.request, urllib.error, http.client
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = {
@@ -93,16 +93,19 @@ class T(unittest.TestCase):
         self.env = {**os.environ, "HQ_DASH_ROOT": self.root, "PATH": bindir + os.pathsep + os.environ["PATH"], "CODEX_HOME": self.codex_home,
                     "HQ_TASKS_DIR": os.path.join(self.root, "tasks"),
                     # 외부 연동은 기본 꺼짐이다. 테스트는 가짜 gh·codex와 합성 값으로만 켠다
-                    "HQ_GITHUB_REPO": "example/repo", "HQ_JIRA_PROJECT": "DEMO", "HQ_ENABLE_CODEX_FLUSH": "1"}
+                    "HQ_GITHUB_REPO": "example/repo", "HQ_JIRA_PROJECT": "DEMO", "HQ_ENABLE_CODEX_FLUSH": "1", "HQ_ENABLE_CLAUDE_FLUSH": "1"}
+        for key in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"):
+            self.env.pop(key, None)
         self.cli("migrate-ids")
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.start()
 
-    def start(self):
-        self.proc = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py"), "serve", "--host", "127.0.0.1", "--port", str(self.port),
-                                      "--alias", ALIAS],
-                                     env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def start(self, *extra, code=None):
+        launch = [sys.executable, "-c", "import server as s\n" + code + "\ns.main()"] if code else [sys.executable, os.path.join(HERE, "server.py")]
+        self.proc = subprocess.Popen([*launch, "serve", "--host", "127.0.0.1", "--port", str(self.port),
+                                      "--alias", ALIAS, *extra],
+                                     env=self.env, cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(50):
             try:
                 urllib.request.urlopen(self.base + "/", timeout=1); return
@@ -140,6 +143,319 @@ class T(unittest.TestCase):
 
     def req(self, *items):
         return {"requestId": secrets.token_hex(16), "action": "hide_from_dashboard", "items": [{"kind": k, "id": i} for k, i in items]}
+
+    def upload(self, raw=b"\x89PNG\r\n\x1a\nfixture", key=None, origin=True, site="same-origin", size=None):
+        headers = {"Content-Type": "image/png", "X-Upload-Key": key or secrets.token_hex(16), "Sec-Fetch-Site": site}
+        if origin:
+            headers["Origin"] = self.base if origin is True else origin
+        if size is not None:
+            headers["Content-Length"] = str(size)
+        req = urllib.request.Request(self.base + "/api/uploads", data=raw, headers=headers)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_image_upload_message_retry_permissions_and_restore(self):
+        key = secrets.token_hex(16)
+        code, uploaded = self.upload(key=key)
+        self.assertEqual(code, 201)
+        uid = uploaded["upload"]["id"]
+        self.assertEqual(self.upload(key=key)[1]["upload"]["id"], uid)
+        self.assertEqual(self.upload(b"\x89PNG\r\n\x1a\nother", key=key)[0], 409)
+        body = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        self.assertEqual(self.post(body, path="/api/messages")[0], 201)
+        self.assertTrue(self.post(body, path="/api/messages")[1]["duplicate"])
+        self.assertEqual(self.post({**body, "attachments": []}, path="/api/messages")[0], 400)
+        self.assertEqual(self.post({**body, "text": "수정"}, path="/api/messages")[0], 409)
+        attachment = self.cli("msg", "read", body["messageId"])["attachments"][0]
+        path = attachment["path"]
+        self.assertTrue(os.path.isabs(path)); self.assertEqual(attachment["type"], "image/png")
+        self.assertEqual(attachment["size"], len(b"\x89PNG\r\n\x1a\nfixture"))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+        self.assertEqual(self.cli("msg", "list")["messages"][0]["attachments"][0]["path"], path)
+        public = self.get("/api/dashboard")[1]["messages"][0]["attachments"][0]
+        self.assertNotIn("path", public); self.assertNotIn("key", public)
+        with urllib.request.urlopen(self.base + "/api/uploads/" + uid) as r:
+            self.assertEqual(r.headers["Content-Type"], "image/png")
+            self.assertEqual(r.headers["Content-Security-Policy"], "sandbox")
+            self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+            self.assertEqual(r.headers["Cache-Control"], "private, no-store")
+        bdir = self.cli("backup")["path"]
+        self.assertNotIn("uploads", os.listdir(bdir))
+        self.cli("msg", "respond", body["messageId"], "--text", "확인했습니다")
+        out = self.root + "-restore-images"
+        self.addCleanup(lambda: shutil.rmtree(out, ignore_errors=True))
+        restored = self.restore(bdir, out)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(rd(os.path.join(out, "private", "messages.json"))["messages"][0]["attachments"][0]["id"], uid)
+
+    def test_image_upload_validation_and_boundaries(self):
+        for raw in (b"<html>image</html>", b"<svg xmlns='http://www.w3.org/2000/svg'/>", b"GIF89a"):
+            self.assertEqual(self.upload(raw)[0], 415)
+        for origin, site in ((False, "same-origin"), ("https://evil.example", "same-origin"), (True, "cross-site")):
+            self.assertEqual(self.upload(origin=origin, site=site)[0], 403)
+        self.assertEqual(self.upload(size=5 * 1024 * 1024 + 1)[0], 413)
+        self.assertEqual(self.upload(key="../escape")[0], 400)
+        ids = []
+        for raw, mime in ((b"\xff\xd8\xffjpeg", "image/jpeg"), (b"RIFF0000WEBPVP8 data", "image/webp")):
+            code, result = self.upload(raw)
+            self.assertEqual(code, 201); self.assertEqual(result["upload"]["type"], mime)
+            ids.append(result["upload"]["id"])
+        msg = {"messageId": secrets.token_hex(16), "kind": "general", "text": "이미지"}
+        for aids in ([secrets.token_hex(16)], ["../escape"], ["a" * 32] * 7, [ids[0]] * 2):
+            self.assertEqual(self.post({**msg, "attachments": aids}, path="/api/messages")[0], 400)
+        for path in ("/api/uploads/", "/api/uploads/../messages.json", "/api/uploads/%2e%2e%2fmessages.json", "/api/uploads/" + "f" * 32):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(self.base + path)
+            self.assertEqual(e.exception.code, 404)
+        with open(os.path.join(self.root, "private", "uploads", "quota.bin"), "wb") as f:
+            f.truncate(256 * 1024 * 1024)
+        self.assertEqual(self.upload()[0], 507)
+
+    def test_cleanup_restart_forced_enumeration_orders(self):
+        for json_first in (True, False):
+            with self.subTest(json_first=json_first):
+                linked = self.upload()[1]["upload"]["id"]
+                orphan = self.upload()[1]["upload"]["id"]
+                self.post({"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [linked]}, path="/api/messages")
+                folder = os.path.join(self.root, "private", "uploads")
+                for uid, days in ((linked, 15), (orphan, 2)):
+                    path = os.path.join(folder, uid + ".json")
+                    a = rd(path); a["created"] -= days * 86400; wr(path, a)
+                self.stop()
+                # 실제 서버 프로세스의 열거 순서를 고정하여 기동 시 정리까지 검증한다.
+                code = ("original = s.os.listdir\n"
+                        f"s.os.listdir = lambda path: sorted(original(path), key=lambda n: (not n.endswith('.json') if {json_first!r} else n.endswith('.json'), n)) if path == s.UPLOADS else original(path)")
+                self.start(code=code)
+                for uid in (linked, orphan):
+                    self.assertFalse(os.path.exists(os.path.join(folder, uid + ".png")))
+                    self.assertFalse(os.path.exists(os.path.join(folder, uid + ".json")))
+                self.assertEqual(self.upload()[0], 201)
+
+    def test_cleanup_failure_logs_and_continues(self):
+        code = """from unittest.mock import patch
+import io
+from contextlib import redirect_stderr
+with s.locked():
+    old = s.accept_upload(b'\\x89PNG\\r\\n\\x1a\\nold', 'a'*32)[0]
+    p = s.os.path.join(s.UPLOADS, old['id']+'.json')
+    a = s.load_json(p); a['created'] -= 2*86400
+    with open(p, 'w') as f: s.json.dump(a, f)
+    errors = io.StringIO()
+    with redirect_stderr(errors), patch.object(s.os, 'unlink', side_effect=PermissionError('denied')):
+        new = s.accept_upload(b'\\x89PNG\\r\\n\\x1a\\nnew', 'b'*32)[0]
+    assert new['id'] != old['id']
+    assert 'upload cleanup failed' in errors.getvalue()
+    with redirect_stderr(errors), patch.object(s.os, 'listdir', side_effect=RuntimeError('unexpected')):
+        s.cleanup_uploads()
+    assert 'unexpected' in errors.getvalue()
+"""
+        result = subprocess.run([sys.executable, "-c", "import server as s\n" + code], cwd=HERE, env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # 손상된 메타데이터도 기동·다음 업로드를 막지 않는다.
+        folder = os.path.join(self.root, "private", "uploads")
+        with open(os.path.join(folder, "c" * 32 + ".json"), "w") as f:
+            f.write("{")
+        self.stop(); self.start()
+        self.assertEqual(self.upload()[0], 201)
+
+    def test_attachment_belongs_to_one_message(self):
+        uid = self.upload()[1]["upload"]["id"]
+        body = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        self.assertEqual(self.post(body, path="/api/messages")[0], 201)
+        self.assertTrue(self.post(body, path="/api/messages")[1]["duplicate"])
+        self.assertEqual(self.post({**body, "messageId": secrets.token_hex(16)}, path="/api/messages")[0], 409)
+        self.cli("msg", "process", body["messageId"])
+        self.assertEqual(self.post({**body, "messageId": secrets.token_hex(16)}, path="/api/messages")[0], 409)
+        uid2 = self.upload()[1]["upload"]["id"]
+        barrier, codes = threading.Barrier(2), []
+        def race():
+            barrier.wait()
+            codes.append(self.post({**body, "messageId": secrets.token_hex(16), "attachments": [uid2]}, path="/api/messages")[0])
+        threads = [threading.Thread(target=race) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(3)
+        self.assertEqual(sorted(codes), [201, 409])
+
+    def raw_post(self, path, length, extra="", body=b""):
+        conn = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+        conn.sendall((f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: {getattr(self, 'raw_origin', self.base)}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nX-Upload-Key: {secrets.token_hex(16)}\r\n{extra}\r\n").encode() + body)
+        return conn
+
+    def test_upload_read_deadline_slots_and_framing(self):
+        self.check_upload_deadline_slots_and_framing()
+
+    def check_upload_deadline_slots_and_framing(self, ext=None):
+        self.raw_origin = ext or self.base
+        self.stop(); self.start(*(("--ext-origin", ext) if ext else ()), code="s.TRANSFER_IDLE_TIMEOUT = 0.8; s.TRANSFER_TOTAL_TIMEOUT = 1.5")
+        for path in ("/api/uploads", "/api/messages"):
+            for extra in ("Transfer-Encoding: chunked\r\n", "Content-Length: 1\r\n"):
+                with self.raw_post(path, 99, extra) as conn:
+                    self.assertIn(b"400", conn.recv(4096).split(b"\r\n")[0])
+            with self.raw_post(path, 99, body=b"x") as conn:
+                self.assertIn(b"408", conn.recv(4096).split(b"\r\n")[0])
+        with self.raw_post("/api/uploads", 1000) as conn:
+            end = threading.Event()
+            def trickle():
+                while not end.wait(0.1):
+                    try: conn.sendall(b"x")
+                    except OSError: return
+            sender = threading.Thread(target=trickle); sender.start()
+            try:
+                before = time.monotonic()
+                self.assertIn(b"408", conn.recv(4096).split(b"\r\n")[0])
+                self.assertLess(time.monotonic() - before, 2)
+            finally:
+                end.set(); sender.join(1)
+        connections = []
+        try:
+            # 각 서버 스레드가 본문 대기까지 진입했는지 peek timeout으로 확인한다.
+            for _ in range(4):
+                conn = self.raw_post("/api/uploads", 1000)
+                connections.append(conn); conn.settimeout(0.05)
+                with self.assertRaises(TimeoutError): conn.recv(1, socket.MSG_PEEK)
+                conn.settimeout(3)
+            with self.raw_post("/api/uploads", 1000) as extra:
+                self.assertIn(b"503", extra.recv(4096).split(b"\r\n")[0])
+            self.assertEqual(self.get("/api/dashboard")[0], 200)
+            self.assertEqual(self.post({"messageId": secrets.token_hex(16), "kind": "general", "text": "진행"}, path="/api/messages")[0], 201)
+            for conn in connections:
+                self.assertIn(b"408", conn.recv(4096).split(b"\r\n")[0])
+        finally:
+            for conn in connections: conn.close()
+        self.assertEqual(self.upload()[0], 201)  # timeout 이후 슬롯 반환
+
+    def test_progressing_slow_transfers_outlive_idle_limit(self):
+        self.stop()
+        self.start(code="""s.TRANSFER_IDLE_TIMEOUT = 0.7
+s.TRANSFER_TOTAL_TIMEOUT = 10
+s.TRANSFER_CHUNK = 4096
+original_setup = s.Handler.setup
+def setup(self):
+    original_setup(self)
+    self.connection.setsockopt(s.socket.SOL_SOCKET, s.socket.SO_SNDBUF, 4096)
+s.Handler.setup = setup
+""")
+        raw = b"\x89PNG\r\n\x1a\n" + b"p" * (128 * 1024 - 8)
+        def paced_post(path, payload, chunk):
+            started = time.monotonic()
+            with self.raw_post(path, len(payload)) as conn:
+                for i in range(0, len(payload), chunk):
+                    if i: time.sleep(0.25)
+                    conn.sendall(payload[i:i+chunk])
+                response = http.client.HTTPResponse(conn); response.begin()
+                self.assertEqual(response.status, 201)
+                result = json.loads(response.read())
+            self.assertGreater(time.monotonic() - started, 0.7)
+            return result
+        uid = paced_post("/api/uploads", raw, 16 * 1024)["upload"]["id"]
+        paced_post("/api/messages", json.dumps({"messageId": secrets.token_hex(16), "kind": "general", "text": "p" * 1400}).encode(), 200)
+        folder = os.path.join(self.root, "captures", "paced"); os.makedirs(folder)
+        with open(os.path.join(folder, "image.png"), "wb") as f: f.write(raw)
+        for path in ("/api/uploads/" + uid, "/captures/paced/image.png"):
+            with self.subTest(path=path), socket.socket() as conn:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024)
+                conn.settimeout(3); conn.connect(("127.0.0.1", self.port))
+                conn.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+                response = http.client.HTTPResponse(conn); response.begin()
+                self.assertEqual(response.status, 200)
+                received, started = bytearray(), time.monotonic()
+                while len(received) < len(raw):
+                    chunk = response.read(min(16 * 1024, len(raw) - len(received)))
+                    self.assertTrue(chunk, "느린 정상 다운로드를 자르면 안 됩니다")
+                    received.extend(chunk)
+                    if len(received) < len(raw): time.sleep(0.25)
+                self.assertEqual(bytes(received), raw)
+                self.assertGreater(time.monotonic() - started, 0.7)
+
+    def test_invalid_metadata_is_skipped_everywhere(self):
+        uid = self.upload()[1]["upload"]["id"]
+        message = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        self.post(message, path="/api/messages")
+        folder = os.path.join(self.root, "private", "uploads")
+        valid = rd(os.path.join(folder, uid + ".json"))
+        for value in ([], None, "text", {}, {**valid, "id": "wrong"}, {**valid, "ext": []}, {**valid, "size": "2"}, {**valid, "created": float("inf")}, {**valid, "created": 10**400}):
+            with self.subTest(value_type=type(value).__name__):
+                wr(os.path.join(folder, uid + ".json"), value)
+                self.assertEqual(self.upload()[0], 201)
+                self.assertFalse(self.get("/api/dashboard")[1]["messages"][0]["attachments"][0]["available"])
+                self.assertIsNone(self.cli("msg", "read", message["messageId"])["attachments"][0]["path"])
+                self.assertEqual(self.post({**message, "messageId": secrets.token_hex(16)}, path="/api/messages")[0], 409)
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(self.base + "/api/uploads/" + uid)
+                self.assertEqual(error.exception.code, 404)
+        self.stop(); self.start()
+        self.assertEqual(self.upload()[0], 201)
+
+    def test_response_write_timeout_releases_slow_connection(self):
+        uid = self.upload(b"\x89PNG\r\n\x1a\n" + b"x" * (5 * 1024 * 1024 - 8))[1]["upload"]["id"]
+        self.stop()
+        code = """s.TRANSFER_IDLE_TIMEOUT = 0.3; s.TRANSFER_TOTAL_TIMEOUT = 2
+original_log = s.Handler.log_message
+def log(self, fmt, *args):
+    if fmt.startswith('response write failed') and self.path.startswith('/api/uploads/'):
+        with open(s.os.path.join(s.ROOT, 'write-timeout'), 'w') as f: f.write(str(args))
+    original_log(self, fmt, *args)
+s.Handler.log_message = log
+"""
+        self.start(code=code)
+        with socket.socket() as conn:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+            conn.settimeout(3); conn.connect(("127.0.0.1", self.port))
+            conn.sendall(f"GET /api/uploads/{uid} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+            self.assertTrue(conn.recv(1, socket.MSG_PEEK))
+            marker = os.path.join(self.root, "write-timeout")
+            deadline = time.monotonic() + 2
+            while (not os.path.exists(marker) or not slurp(marker)) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(marker), "느린 다운로드의 소켓 쓰기가 시간 제한으로 끝나야 합니다")
+            self.assertIn(b"timed out", slurp(marker))
+
+    def test_slow_image_and_capture_do_not_hold_data_lock(self):
+        raw = b"\x89PNG\r\n\x1a\n" + b"x" * (5 * 1024 * 1024 - 8)
+        uid = self.upload(raw)[1]["upload"]["id"]
+        msg = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        self.post(msg, path="/api/messages")
+        folder = os.path.join(self.root, "captures", "slow"); os.makedirs(folder)
+        with open(os.path.join(folder, "large.png"), "wb") as f: f.write(raw)
+        for path in ("/api/uploads/" + uid, "/captures/slow/large.png"):
+            with self.subTest(path=path), socket.socket() as conn:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+                conn.settimeout(3); conn.connect(("127.0.0.1", self.port))
+                conn.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n\r\n".encode())
+                # 첫 바이트만 관찰하고 읽지 않는다. 5MiB 응답은 작은 수신 버퍼에서 전송 대기한다.
+                self.assertTrue(conn.recv(1, socket.MSG_PEEK))
+                time.sleep(0.1)
+                with urllib.request.urlopen(self.base + "/api/dashboard", timeout=2) as response:
+                    self.assertEqual(response.status, 200)
+                req = urllib.request.Request(self.base + "/api/messages", data=json.dumps({"messageId": secrets.token_hex(16), "kind": "general", "text": "다운로드 중 전송"}).encode(), headers={"Origin": self.base, "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=2) as response:
+                    self.assertEqual(response.status, 201)
+                for args in (("item", "get", self.ids()["work"][0]), ("item", "set", self.ids()["work"][0], "--set", "status=다운로드 중 확인", "--reason", "느린 응답 병행 검증"), ("msg", "list"), ("msg", "read", msg["messageId"])):
+                    result = subprocess.run([sys.executable, os.path.join(HERE, "server.py"), *args], env=self.env, capture_output=True, text=True, timeout=2)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_image_cleanup_orphan_and_linked_expiry(self):
+        linked = self.upload()[1]["upload"]["id"]
+        orphan = self.upload()[1]["upload"]["id"]
+        body = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [linked]}
+        self.post(body, path="/api/messages")
+        folder = os.path.join(self.root, "private", "uploads")
+        def age(uid, days):
+            p = os.path.join(folder, uid + ".json"); a = rd(p); a["created"] -= days * 86400; wr(p, a)
+        age(orphan, 2); age(linked, 2)
+        self.upload()  # 새 업로드에서 미연결 파일만 1일 기준으로 지운다.
+        self.assertFalse(os.path.exists(os.path.join(folder, orphan + ".png")))
+        self.assertTrue(os.path.exists(os.path.join(folder, linked + ".png")))
+        age(linked, 13)
+        self.stop(); self.start()  # 기동 시 14일 지난 연결 파일을 지운다.
+        self.assertFalse(os.path.exists(os.path.join(folder, linked + ".png")))
+        self.assertFalse(self.get("/api/dashboard")[1]["messages"][0]["attachments"][0]["available"])
+        self.assertIsNone(self.cli("msg", "read", body["messageId"])["attachments"][0]["path"])
+        self.assertTrue(self.post(body, path="/api/messages")[1]["duplicate"])
 
     def test_full_flow_hidden_persists(self):
         ids = self.ids()
@@ -224,6 +540,119 @@ class T(unittest.TestCase):
             urllib.request.urlopen(req)
         self.assertEqual(e.exception.code, 403)
 
+    def test_extension_images_origin_and_validation(self):
+        ext = "chrome-extension://" + "a" * 32
+        self.assertEqual(self.upload(origin=ext)[0], 403)
+        self.stop(); self.start("--ext-origin", ext)
+        key = secrets.token_hex(16)
+        uid = self.upload(origin=ext, key=key, site="cross-site")[1]["upload"]["id"]
+        code, body = self.upload(origin=ext, key=key)
+        self.assertEqual((code, body["duplicate"], body["upload"]["id"]), (200, True, uid))
+        self.assertEqual(self.upload(b"\x89PNG\r\n\x1a\nchanged", origin=ext, key=key)[0], 409)
+        msg = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        for bad in (False, "chrome-extension://" + "b" * 32, ext + "/", "https://evil.example", "null"):
+            self.assertEqual(self.upload(origin=bad)[0], 403)
+            conn = http.client.HTTPConnection("127.0.0.1", self.port)
+            try:
+                headers = {"Content-Type": "application/json", **({"Origin": bad} if bad else {})}
+                conn.request("POST", "/api/messages", json.dumps(msg), headers)
+                self.assertEqual(conn.getresponse().status, 403)
+            finally:
+                conn.close()
+        self.assertEqual(self.post(msg, origin=ext, ctype="text/plain", path="/api/messages")[0], 415)
+        self.assertEqual(self.post({**msg, "kind": "work", "itemId": "w-missing"}, origin=ext, path="/api/messages")[0], 400)
+        self.assertEqual(self.post(msg, origin=ext, path="/api/messages")[0], 201)
+        self.assertTrue(self.post(msg, origin=ext, path="/api/messages")[1]["duplicate"])
+        self.assertEqual(self.post({**msg, "text": "changed"}, origin=ext, path="/api/messages")[0], 409)
+        self.assertEqual(self.post({**msg, "messageId": secrets.token_hex(16)}, origin=ext, path="/api/messages")[0], 409)
+        for raw in (b"<svg/>", b"GIF89a", b"<html/>"):
+            self.assertEqual(self.upload(raw, origin=ext)[0], 415)
+        self.assertEqual(self.upload(origin=ext, size=5 * 1024 * 1024 + 1)[0], 413)
+        self.assertEqual(self.upload(origin=ext, key="invalid")[0], 400)
+        ids = [self.upload(origin=ext)[1]["upload"]["id"] for _ in range(7)]
+        fresh = {**msg, "messageId": secrets.token_hex(16)}
+        self.assertEqual(self.post({**fresh, "attachments": ids}, origin=ext, path="/api/messages")[0], 400)
+        self.assertEqual(self.post({**fresh, "attachments": ids[:6]}, origin=ext, path="/api/messages")[0], 201)
+        self.assertEqual(self.post({**fresh, "messageId": secrets.token_hex(16), "text": "x" * 17000}, origin=ext, path="/api/messages")[0], 413)
+        with open(os.path.join(self.root, "private", "uploads", "quota.bin"), "wb") as f:
+            f.truncate(256 * 1024 * 1024)
+        self.assertEqual(self.upload(origin=ext)[0], 507)
+
+
+    def test_duplicate_origin_headers_rejected_for_web_and_extension(self):
+        ext, evil = "chrome-extension://" + "a" * 32, "https://evil.example"
+        self.stop(); self.start("--ext-origin", ext)
+        for good in (self.base, ext):
+            for path in ("/api/uploads", "/api/messages", "/api/flush", "/api/requests"):
+                raw = b"\x89PNG\r\n\x1a\nfixture" if path == "/api/uploads" else b"{}"
+                for origins in ((good, evil), (evil, good), (good, good), (), (good + " " + evil,)):
+                    with self.subTest(good=good, path=path, origins=origins):
+                        conn = http.client.HTTPConnection("127.0.0.1", self.port)
+                        try:
+                            conn.putrequest("POST", path)
+                            for origin in origins:
+                                conn.putheader("Origin", origin)
+                            conn.putheader("Content-Type", "application/json")
+                            conn.putheader("Content-Length", str(len(raw)))
+                            conn.putheader("X-Upload-Key", secrets.token_hex(16))
+                            conn.endheaders(raw)
+                            response = conn.getresponse()
+                            self.assertEqual(response.status, 403)
+                            response.read()
+                        finally:
+                            conn.close()
+            # 같은 공통 검사 뒤 정상 화면·확장 요청은 계속 받는다.
+            uid = self.upload(origin=good)[1]["upload"]["id"]
+            msg = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+            self.assertEqual(self.post(msg, origin=good, path="/api/messages")[0], 201)
+
+
+    def test_extension_origin_boundary(self):
+        ext, other = "chrome-extension://" + "a" * 32, "chrome-extension://" + "b" * 32
+        w = self.ids()["work"]
+        msg = lambda: {"messageId": secrets.token_hex(16), "kind": "work", "itemId": w[0], "text": "확장 요청"}
+        flush = lambda: {"flushId": secrets.token_hex(16)}
+        # 기본(미등록)은 어떤 확장도 받지 않는다
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages")[0], 403)
+        self.assertEqual(self.post(flush(), origin=ext, path="/api/flush")[0], 403)
+        self.stop(); self.start("--ext-origin", ext)
+        # Sec-Fetch-Site가 없어도(실측: http 대상) 있어도 정확한 origin이면 메시지·flush를 받는다
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages")[0], 201)
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages", site="none")[0], 201)
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages", site="cross-site")[0], 201)
+        self.assertEqual(self.post(flush(), origin=ext, path="/api/flush")[0], 201)
+        # 숨김 요청은 열지 않는다. 요청함에 아무것도 쌓이지 않는다
+        requests = lambda: rd(os.path.join(self.root, "private", "state.json")).get("requests", [])
+        before = requests()
+        self.assertEqual(self.post(self.req(("work", w[0])), origin=ext)[0], 403)
+        self.assertEqual(requests(), before)
+        # 다른 확장, 비슷한 값, 웹 페이지 origin은 거절한다
+        for bad in (other, ext + "/", ext.upper(), "chrome-extension://" + "a" * 31, "https://github.com", "null"):
+            self.assertEqual(self.post(msg(), origin=bad, path="/api/messages")[0], 403, bad)
+            self.assertEqual(self.post(flush(), origin=bad, path="/api/flush")[0], 403, bad)
+        # 확장 경로도 Content-Type 검사와 항목 검증은 그대로다
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages", ctype="text/plain")[0], 415)
+        self.assertEqual(self.post({**msg(), "itemId": "w-없음"}, origin=ext, path="/api/messages")[0], 400)
+        # 같은 messageId 재시도는 한 건, 내용을 바꾸면 409
+        m = msg()
+        self.assertEqual(self.post(m, origin=ext, path="/api/messages")[0], 201)
+        code, body = self.post(m, origin=ext, path="/api/messages")
+        self.assertEqual((code, body["duplicate"]), (200, True))
+        self.assertEqual(self.post({**m, "text": "고친 글"}, origin=ext, path="/api/messages")[0], 409)
+        self.assertEqual(sum(x["messageId"] == m["messageId"] for x in self.get("/api/dashboard")[1]["messages"]), 1)
+        # 기존 화면 origin은 그대로 동작한다
+        self.assertEqual(self.post(msg(), path="/api/messages")[0], 201)
+        # 잘못된 형식이면 서버를 띄우지 않는다
+        out = subprocess.run([sys.executable, os.path.join(HERE, "server.py"), "serve", "--host", "127.0.0.1", "--port", str(free_port()), "--ext-origin", "https://github.com"],
+                             env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("--ext-origin", out.stderr)
+
+
+    def test_extension_upload_deadline_slots_and_framing(self):
+        self.check_upload_deadline_slots_and_framing("chrome-extension://" + "a" * 32)
+
+
     def test_unknown_at_process_time_fails_not_hides(self):
         ids = self.ids()
         b = self.req(("work", ids["work"][0]))
@@ -263,7 +692,9 @@ class T(unittest.TestCase):
     def test_defaults_isolated_and_opt_in(self):
         # 기본값: init 전에는 루트를 만들지 않고, 외부 연동(PR·Jira·Codex)은 설정 없이는 실행하지 않는다
         tmp = tempfile.mkdtemp(prefix="hqdash-init-")
-        env = {k: v for k, v in self.env.items() if k not in ("HQ_GITHUB_REPO", "HQ_JIRA_PROJECT", "HQ_ENABLE_CODEX_FLUSH", "HQ_TASKS_DIR")}
+        env = {k: v for k, v in self.env.items() if k not in ("HQ_GITHUB_REPO", "HQ_JIRA_PROJECT", "HQ_ENABLE_CODEX_FLUSH", "HQ_ENABLE_CLAUDE_FLUSH", "HQ_TASKS_DIR")}
+        env["HOME"] = os.path.join(tmp, "home")
+        os.makedirs(env["HOME"])
         env["HQ_DASH_ROOT"] = root = os.path.join(tmp, "r")
         run = lambda *a, script="server.py": subprocess.run([sys.executable, os.path.join(HERE, script), *a], env=env, capture_output=True, text=True)
         try:
@@ -281,8 +712,97 @@ class T(unittest.TestCase):
             self.assertEqual(run("init", "--demo").returncode, 0)
             self.assertTrue(rd(os.path.join(demo, "public", "data.json"))["work"])
             self.assertEqual(run("check").returncode, 0)
+            # 빈 상태와 demo 모두 기본 서버의 실제 HTTP 경로에서 외부 실행이 0건이다.
+            for runtime in (root, demo):
+                env["HQ_DASH_ROOT"] = runtime
+                port = free_port()
+                with subprocess.Popen([sys.executable, os.path.join(HERE, "server.py"), "serve", "--port", str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as proc:
+                    try:
+                        for _ in range(50):
+                            try:
+                                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/dashboard", timeout=1) as response:
+                                    view = json.loads(response.read())
+                                break
+                            except OSError: time.sleep(0.05)
+                        else: self.fail("fresh 서버가 시작되지 않았습니다")
+                        self.assertIsNone(view["flush"]["registration"])
+                        self.assertFalse(view["prRefresh"]["running"])
+                        for calls in ("gh-calls", "codex-calls"):
+                            self.assertFalse(os.path.exists(os.path.join(runtime, calls)))
+                    finally:
+                        proc.terminate(); proc.wait(5)
+
         finally:
             shutil.rmtree(tmp)
+
+    def test_capture_files_and_headers(self):
+        folder = os.path.join(self.root, "captures", "sample-gallery")
+        os.makedirs(folder)
+        types = {"index.html": "text/html; charset=utf-8", "photo.png": "image/png",
+                 "photo.jpg": "image/jpeg", "photo.jpeg": "image/jpeg", "photo.webp": "image/webp",
+                 "photo.gif": "image/gif", "info.json": "application/json; charset=utf-8"}
+        for name, ctype in types.items():
+            content = ("capture " + name).encode()
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(content)
+            paths = ["/captures/sample-gallery/" + name]
+            if name == "index.html":
+                paths.append("/captures/sample-gallery/")
+            for path in paths:
+                with self.subTest(path=path), urllib.request.urlopen(self.base + path) as r:
+                    self.assertEqual(r.status, 200)
+                    self.assertEqual(r.read(), content)
+                    self.assertEqual(r.headers["Content-Type"], ctype)
+                    self.assertEqual(r.headers["Content-Security-Policy"], "sandbox allow-scripts")
+                    self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+                    self.assertEqual(r.headers["Cache-Control"], "no-store")
+        with open(os.path.join(folder, "index.html"), "wb") as f:
+            f.write(b"replaced")
+        self.assertEqual(self.get("/captures/sample-gallery/")[1], b"replaced")
+
+    def test_capture_path_rejections(self):
+        folder = os.path.join(self.root, "captures", "demo")
+        os.makedirs(folder)
+        for name in ("index.html", ".hidden.html", "secret.txt", "json"):
+            with open(os.path.join(folder, name), "w") as f:
+                f.write("must not escape")
+        os.makedirs(os.path.join(folder, "nested"))
+        os.makedirs(os.path.join(self.root, "backups"), exist_ok=True)
+        wr(os.path.join(self.root, "private", "secret.json"), {"secret": True})
+        os.symlink(self.data, os.path.join(folder, "outside.json"))
+        os.symlink(os.path.join(self.root, "private"), os.path.join(self.root, "captures", "outside"))
+        for path in ("/captures/", "/captures/demo", "/captures/missing/", "/captures/demo/missing.png",
+                     "/captures/../public/data.json", "/captures/demo/../index.html",
+                     "/captures/%2e%2e/data.json", "/captures/demo/%2e%2e", "/captures/demo/%252e%252e",
+                     "/captures/demo/%2fprivate%2fsecret.json", "/captures//demo/index.html",
+                     "/captures/demo//index.html", "/captures/demo//etc/passwd", "/captures/demo/.hidden.html",
+                     "/captures/.hidden/index.html", "/captures/demo/secret.txt", "/captures/demo/json",
+                     "/captures/demo/nested/index.html", "/captures/demo/nested", "/captures/demo/outside.json",
+                     "/captures/outside/secret.json", "/captures/" + "a" * 129 + "/",
+                     "/captures/demo/" + "a" * 129 + ".html", "/captures/demo/index.html/",
+                     "/private/secret.json", "/public/data.json", "/backups/", "/data.json"):
+            with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(self.base + path)
+            self.assertEqual(err.exception.code, 404, path)
+        # captures 자체가 다른 실행 데이터로 향하는 심볼릭 링크인 경우도 거절한다.
+        shutil.rmtree(os.path.join(self.root, "captures"))
+        os.makedirs(os.path.join(self.root, "private", "demo"))
+        wr(os.path.join(self.root, "private", "demo", "secret.json"), {"secret": True})
+        os.symlink(os.path.join(self.root, "private"), os.path.join(self.root, "captures"))
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(self.base + "/captures/demo/secret.json")
+        self.assertEqual(err.exception.code, 404)
+        os.unlink(os.path.join(self.root, "captures"))
+
+    def test_capture_opaque_origin_cannot_post(self):
+        # sandbox allow-scripts 문서의 POST Origin은 문자열 null이다. 확장을 허용해도 동일하다.
+        for extra in ((), ("--ext-origin", "chrome-extension://" + "a" * 32)):
+            self.stop(); self.start(*extra)
+            for path in ("/api/messages", "/api/requests", "/api/flush"):
+                code, _ = self.post({}, origin="null", path=path, site="cross-site")
+                self.assertEqual(code, 403, path)
+                self.assertEqual(self.post({}, origin="null", path=path)[0], 403, path)
+        self.assertEqual(self.cli("msg", "list")["messages"], [])
 
     def test_static_allowlist(self):
         self.assertEqual(self.get("/")[0], 200)
@@ -496,7 +1016,7 @@ class T(unittest.TestCase):
         self.assertEqual(self.ids(), before)
         self.assertEqual(rd(self.data)["globalLimitsId"], lid)
 
-    def test_nonstandard_existing_id_hq86(self):
+    def test_nonstandard_existing_id_preserved(self):
         # q-legacy01처럼 사람이 직접 넣은 8hex가 아닌 id: 보존·번호·삭제·메시지가 모두 같은 인덱스를 따른다
         raw = rd(self.data); raw["questions"].append({"id": "q-legacy01", "q": "형식 밖 질문?", "status": "열림"}); wr(self.data, raw)
         self.assertEqual(self.cli("migrate-ids")["added"], 0)
@@ -899,6 +1419,194 @@ class T(unittest.TestCase):
         self.assertEqual(len(self.codex_calls()), 1)
         self.assertNotEqual(self.cli_fail("flush", "done", "--id", r["flush"]["flushId"]).returncode, 0)  # 실패 건은 처리 기록 대상이 아니다
 
+    # 가짜 Claude inbox: 받은 줄을 모아 두는 Unix socket 리스너. 경로 길이 제한 때문에 /tmp 아래 짧은 디렉터리를 쓴다
+    def fake_claude(self):
+        d = tempfile.mkdtemp(prefix="hq", dir="/tmp"); self.addCleanup(shutil.rmtree, d, True)
+        path, lines = os.path.join(d, "s.sock"), []
+        srv = socket.socket(socket.AF_UNIX); srv.bind(path); srv.listen(5); self.addCleanup(srv.close)
+
+        def run():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                with c:
+                    buf = b""
+                    while chunk := c.recv(4096):
+                        buf += chunk
+                lines.extend(buf.decode().splitlines())
+        threading.Thread(target=run, daemon=True).start()
+        return path, lines
+
+    def self_env(self, sid, sock, token="tok-SECRET"):
+        return {**self.env, "CLAUDE_CODE_SESSION_ID": sid, "CLAUDE_CODE_MESSAGING_SOCKET": sock, "CLAUDE_CODE_MESSAGING_TOKEN": token}
+
+    def register_self(self, env):
+        out = subprocess.run([sys.executable, os.path.join(HERE, "server.py"), "flush", "register", "--self"], env=env, capture_output=True, text=True)
+        return out
+
+    def test_flush_claude_self_register_deliver_and_secrets(self):
+        sock, lines = self.fake_claude()
+        sid = "00000000-0000-4000-8000-000000000042"
+        out = self.register_self(self.self_env(sid, sock))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        reg = json.loads(out.stdout)["registration"]
+        self.assertEqual((reg["provider"], reg["thread"]), ("claude", sid))
+        for text in (out.stdout, json.dumps(self.cli("flush", "status")), json.dumps(self.get("/api/dashboard")[1])):
+            self.assertNotIn("tok-SECRET", text); self.assertNotIn(sock, text)
+        self.assertEqual(self.get("/api/dashboard")[1]["flush"]["registration"]["provider"], "claude")
+        fid = secrets.token_hex(16)
+        code, r = self.flush(fid)
+        self.assertEqual((code, r["flush"]["status"]), (201, "queued"))
+        self.assertNotIn("thread", r["flush"]); self.assertNotIn("tok-SECRET", json.dumps(r)); self.assertNotIn(sock, json.dumps(r))
+        for _ in range(50):
+            if len(lines) >= 2: break
+            time.sleep(0.05)
+        self.assertEqual(json.loads(lines[0]), {"type": "auth", "token": "tok-SECRET"})
+        self.assertEqual(json.loads(lines[1]), {"type": "user", "message": {"role": "user", "content": __import__("server").FLUSH_MESSAGE.format(fid=fid, root=self.root)}})
+        self.assertEqual(self.codex_calls(), [])
+        self.assertEqual(self.cli("flush", "done", "--id", fid)["flushes"][-1]["status"], "processed")
+
+    def test_flush_claude_socket_gone_fails(self):
+        sock, _ = self.fake_claude()
+        self.assertEqual(self.register_self(self.self_env("00000000-0000-4000-8000-000000000042", sock)).returncode, 0)
+        os.unlink(sock)  # 세션 종료로 socket이 사라진 상황
+        code, r = self.flush()
+        self.assertEqual((code, r["flush"]["status"]), (201, "failed"))
+        self.assertIn("종료", r["flush"]["error"])
+        self.assertNotEqual(self.cli_fail("flush", "done", "--id", r["flush"]["flushId"]).returncode, 0)
+
+    def test_flush_self_register_validation(self):
+        sock, _ = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
+        env_no = {k: v for k, v in self.env.items() if not k.startswith(("CLAUDE_CODE_", "CODEX_THREAD_ID"))}
+        for env in (self.self_env("not-a-uuid", sock),                      # session id 형식
+                    self.self_env(sid, os.path.join(os.path.dirname(sock), "none.sock")),  # socket 없음
+                    self.self_env(sid, self.data),                          # socket이 아닌 일반 파일
+                    {**env_no, "CLAUDE_CODE_SESSION_ID": sid},              # 일부 변수만 있음
+                    env_no):                                                # 판정 근거 없음
+            self.assertNotEqual(self.register_self(env).returncode, 0)
+        self.assertIsNone(self.cli("flush", "status")["registration"])
+        # token을 argv로 받는 옵션은 없다
+        self.assertNotEqual(self.cli_fail("flush", "register", "--self", "--token", "x").returncode, 0)
+
+    def test_flush_self_codex_env_and_provider_switch(self):
+        sock, lines = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
+        env_no = {k: v for k, v in self.env.items() if not k.startswith("CLAUDE_CODE_")}
+        out = self.register_self({**env_no, "CODEX_THREAD_ID": THREAD})
+        self.assertEqual((json.loads(out.stdout)["registration"]["provider"], json.loads(out.stdout)["registration"]["threadName"]), ("codex", "합성 coordinator"))
+        self.assertNotEqual(self.register_self({**env_no, "CODEX_THREAD_ID": "00000000-0000-7000-8000-000000000000"}).returncode, 0)
+        # Codex → Claude 교체: 이전 등록이 남고 새 provider에만 보낸다
+        reg = json.loads(self.register_self(self.self_env(sid, sock)).stdout)["registration"]
+        self.assertEqual(reg["previous"], {"provider": "codex", "thread": THREAD})
+        self.assertEqual(self.flush()[1]["flush"]["status"], "queued")
+        self.assertEqual(self.codex_calls(), [])
+        for _ in range(50):
+            if len(lines) >= 2: break
+            time.sleep(0.05)
+        self.assertEqual(len(lines), 2)
+        # Claude → Codex 교체 뒤에는 Claude socket에 더 보내지 않는다
+        self.cli("flush", "done", "--id", self.cli("flush", "status")["flushes"][-1]["flushId"])
+        reg = self.cli("flush", "register", "--provider", "codex", "--thread", THREAD, "--evidence", "e")["registration"]
+        self.assertEqual(reg["previous"], {"provider": "claude", "thread": sid})
+        box = rd(os.path.join(self.root, "private", "flush.json")); box["flushes"][-1]["createdAt"] = "2001-01-01T00:00:00Z"
+        wr(os.path.join(self.root, "private", "flush.json"), box)  # cooldown 통과
+        self.assertEqual(self.flush()[1]["flush"]["status"], "queued")
+        self.assertEqual(len(self.codex_calls()), 1); self.assertEqual(len(lines), 2)
+
+    def test_flush_reregister_ignores_old_queued(self):
+        sock, lines = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
+        self.assertEqual(self.register_self(self.self_env(sid, sock, "tokA")).returncode, 0)
+        first = self.flush()[1]["flush"]
+        self.assertTrue(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(self.flush()[1]["duplicate"], True)  # 같은 등록 안에서는 여전히 중복이다
+        self.assertEqual(self.register_self(self.self_env(sid, sock, "tokB")).returncode, 0)  # 같은 session id, 새 토큰(resume)
+        box = rd(os.path.join(self.root, "private", "flush.json")); box["flushes"][-1]["createdAt"] = "2001-01-01T00:00:00Z"
+        wr(os.path.join(self.root, "private", "flush.json"), box)  # 이전 요청을 오래된 것으로 만든다(cooldown 통과, 재등록 전 요청)
+        self.assertFalse(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
+        code, r = self.flush()
+        self.assertEqual((code, r["duplicate"], r["flush"]["status"]), (201, False, "queued"))
+        self.assertNotEqual(r["flush"]["flushId"], first["flushId"])
+
+    def test_flush_same_second_generations_and_legacy_registration(self):
+        fixed = "2001-02-03T04:05:06Z"
+        code = f"s.now = lambda: {fixed!r}"
+        self.stop(); self.start(code=code)
+
+        def register():
+            args = ["flush", "register", "--provider", "codex", "--thread", THREAD, "--evidence", "synthetic session"]
+            result = subprocess.run([sys.executable, "-c", "import server as s\n" + code + "\ns.main()", *args],
+                                    env=self.env, cwd=HERE, capture_output=True, text=True, check=True)
+            self.assertNotIn("generation", result.stdout)
+            return json.loads(result.stdout)
+
+        path = os.path.join(self.root, "private", "flush.json")
+        register()
+        first_generation = rd(path)["registration"]["generation"]
+        self.assertRegex(first_generation, r"^[0-9a-f]{32}$")
+        first = self.flush()[1]["flush"]
+        self.assertTrue(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
+        register()  # 시각과 thread가 같아도 새 등록이다. cooldown은 과거 고정 시각으로 분리한다.
+        box = rd(path)
+        self.assertEqual(box["registration"]["registeredAt"], first["createdAt"])
+        self.assertNotEqual(box["registration"]["generation"], first_generation)
+        self.assertFalse(self.get("/api/dashboard")[1]["flush"]["recent"][-1]["active"])
+        status, second = self.flush()
+        self.assertEqual((status, second["duplicate"], second["flush"]["status"]), (201, False, "queued"))
+        self.assertNotEqual(second["flush"]["flushId"], first["flushId"])
+        self.assertEqual(len(self.codex_calls()), 2)
+        self.assertEqual(self.flush()[1]["flush"]["flushId"], second["flush"]["flushId"])
+        self.assertEqual(self.flush(first["flushId"])[1]["flush"]["flushId"], first["flushId"])  # 응답 유실 재시도 보존
+        public = self.get("/api/dashboard")[1]["flush"]
+        self.assertEqual([f["active"] for f in public["recent"]], [False, True])
+        for value in (second, public, self.cli("flush", "status")):
+            self.assertNotIn("generation", json.dumps(value))
+            self.assertNotIn(first_generation, json.dumps(value))
+
+        # 기존 등록/flush에는 세대 키가 없다. 이전 중복 억제를 유지하고 다음 등록에서 분리한다.
+        box = rd(path); box["registration"].pop("generation"); box["flushes"] = [box["flushes"][-1]]
+        box["flushes"][0].pop("generation"); wr(path, box)
+        self.assertTrue(self.get("/api/dashboard")[1]["flush"]["recent"][0]["active"])
+        self.assertEqual(self.flush()[1]["flush"]["flushId"], second["flush"]["flushId"])
+        register()
+        self.assertFalse(self.get("/api/dashboard")[1]["flush"]["recent"][0]["active"])
+        self.assertEqual(self.flush()[0], 201)
+        self.assertEqual(len(self.codex_calls()), 3)
+
+    def test_flush_self_ambiguous_env_and_explicit_provider(self):
+        sock, _ = self.fake_claude(); sid = "00000000-0000-4000-8000-000000000042"
+        both = {**self.self_env(sid, sock), "CODEX_THREAD_ID": THREAD}
+        self.assertNotEqual(self.register_self(both).returncode, 0)  # 추측하지 않는다
+        self.assertIsNone(self.cli("flush", "status")["registration"])
+
+        def reg_as(provider):
+            return subprocess.run([sys.executable, os.path.join(HERE, "server.py"), "flush", "register", "--self", "--provider", provider],
+                                  env=both, capture_output=True, text=True)
+        out = reg_as("codex")
+        self.assertEqual((out.returncode, json.loads(out.stdout)["registration"]["thread"]), (0, THREAD))
+        out = reg_as("claude")
+        reg = json.loads(out.stdout)["registration"]
+        self.assertEqual((out.returncode, reg["provider"], reg["thread"]), (0, "claude", sid))
+        self.assertNotIn("tok-SECRET", out.stdout)
+        # Claude 변수가 없는데 --provider claude면 실패한다
+        no = subprocess.run([sys.executable, os.path.join(HERE, "server.py"), "flush", "register", "--self", "--provider", "claude"],
+                            env={k: v for k, v in self.env.items() if not k.startswith("CLAUDE_CODE_")}, capture_output=True, text=True)
+        self.assertNotEqual(no.returncode, 0)
+
+    def test_flush_provider_opt_in_is_independent(self):
+        sock, lines = self.fake_claude()
+        sid = "00000000-0000-4000-8000-000000000099"
+        env = self.self_env(sid, sock)
+        for codex_flag, claude_flag, expected in (("0", "0", False), ("1", "0", False), ("0", "1", True)):
+            out = self.register_self({**env, "HQ_ENABLE_CODEX_FLUSH": codex_flag, "HQ_ENABLE_CLAUDE_FLUSH": claude_flag})
+            self.assertEqual(out.returncode == 0, expected, out.stderr)
+        self.env["HQ_ENABLE_CLAUDE_FLUSH"] = "0"
+        self.stop(); self.start()
+        self.assertEqual(self.flush()[1]["flush"]["status"], "failed")
+        self.assertEqual(lines, [])
+        self.assertEqual(self.codex_calls(), [])
+
     def test_flush_rejections(self):
         self.assertEqual(self.flush(origin="http://evil.example")[0], 403)
         self.assertEqual(self.post({"flushId": "x"}, path="/api/flush")[0], 400)
@@ -1022,9 +1730,10 @@ class T(unittest.TestCase):
         """운영 루트의 data·private 파일 내용과 권한(백업 디렉터리 제외)."""
         out = {}
         for d in ("public", "private"):
-            for n in sorted(os.listdir(os.path.join(self.root, d))):
-                p = os.path.join(self.root, d, n)
-                out[f"{d}/{n}"] = (slurp(p), oct(os.stat(p).st_mode & 0o777))
+            for folder, _, names in os.walk(os.path.join(self.root, d)):
+                for n in sorted(names):
+                    p = os.path.join(folder, n)
+                    out[os.path.relpath(p, self.root)] = (slurp(p), oct(os.stat(p).st_mode & 0o777))
         return out
 
     def test_backup_daily_first_and_manual(self):
@@ -1156,6 +1865,62 @@ class T(unittest.TestCase):
         self.assertIn("무결성 실패", self.restore(bdir, out).stderr)
         self.assertIn("완료된 백업", self.restore(os.path.join(self.root, "backups"), out).stderr)
 
+    # ---------- 파생 관계 (derivedFrom) ----------
+    def test_item_derived_from(self):
+        self.get("/api/dashboard")
+        st = os.path.join(self.root, "private", "state.json")
+        ids = self.ids(); a, b = ids["work"]; q, dec = ids["question"], ids["decision"]
+        ref_a = rd(st)["refs"]["map"][a]
+        refs0, status_a = rd(st)["refs"], rd(self.data)["work"][0]["status"]
+        r = self.item("add", "work", file={"title": "파생 작업", "status": "진행 중", "derivedFrom": ref_a})  # HQ 번호는 내부 id로 저장
+        kid = r["id"]
+        self.assertEqual(r["item"]["derivedFrom"], a)
+        r = self.item("set", b, "--set", f"derivedFrom={a}", "--reason", "성격이 달라 별도 티켓")
+        self.assertEqual((r["rev"], r["item"]["history"][-1]["change"]), (1, "derivedFrom 추가"))
+        self.assertTrue(self.item("set", b, "--set", f"derivedFrom={ref_a}")["unchanged"])  # 같은 연결은 다시 쓰지 않는다(중복 없음)
+        # 역방향은 저장 없이 계산한다. 원본 자체·번호·상태는 그대로다(전파 없음)
+        origin = self.item("get", a)
+        self.assertEqual({x["id"] for x in origin["derivedItems"]}, {kid, b})
+        self.assertNotIn("derivedFrom", origin["item"])
+        self.assertEqual((origin["rev"], origin["item"]["status"]), (0, status_a))
+        self.assertEqual({k: v for k, v in rd(st)["refs"]["map"].items() if k != kid}, refs0["map"])  # 기존 번호 보존
+        self.assertEqual(self.item("get", kid)["derivedItems"], [])
+        # 자기 연결·순환·없는 대상·PR·문자열 아닌 값은 거절하고 아무것도 쓰지 않는다
+        before = slurp(self.data)
+        for args in ((a, "--set", f"derivedFrom={a}"), (a, "--set", f"derivedFrom={ref_a}"), (a, "--set", f"derivedFrom={kid}"),
+                     (a, "--set", "derivedFrom=w-00000000"), (a, "--set", "derivedFrom=HQ-999999"), (a, "--set", "derivedFrom=pr-1")):
+            self.assertEqual(self.cli_fail("item", "set", *args).returncode, 1, args)
+        self.assertEqual(self.cli_fail("item", "set", a, "--file", self._f({"derivedFrom": [q]})).returncode, 1)
+        self.assertEqual(self.cli_fail("item", "add", "work", "--set", "title=t", "--set", "status=s", "--set", "derivedFrom=w-00000000").returncode, 1)
+        self.assertEqual(slurp(self.data), before)
+        # 긴 사슬의 순환도 막는다: q → kid → a 인데 a → q 거절
+        self.item("set", q, "--set", f"derivedFrom={kid}")
+        self.assertEqual(self.cli_fail("item", "set", a, "--set", f"derivedFrom={q}").returncode, 1)
+        # 숨긴 항목: 연결은 유지하고 되살리지 않는다. 공개 응답에서 숨긴 쪽만 빠지고 CLI 역방향은 hidden으로 알려 준다
+        self.assertEqual(self.post(self.req(("work", b)))[0], 201)
+        self.cli("process-inbox")
+        self.assertEqual(rd(self.data)["work"][1]["derivedFrom"], a)
+        view = self.get("/api/dashboard")[1]["data"]["work"]
+        self.assertEqual([w["id"] for w in view if w.get("derivedFrom") == a], [kid])
+        self.assertEqual({x["id"]: x["hidden"] for x in self.item("get", a)["derivedItems"]}, {kid: False, b: True})
+        self.assertEqual(self.item("set", kid, "--set", f"derivedFrom={b}")["item"]["derivedFrom"], b)  # 숨긴 항목도 원본이 될 수 있다
+        # 해소된 결정도 원본이 될 수 있고, 파생 연결만으로 '해소된 결정 언급' 경고를 내지 않는다
+        self.item("resolve", dec, "--source", "chat:2030-02-01", "--reason", "확정")
+        w = self.item("add", "work", file={"title": "결정 파생", "status": "대기", "state": "waiting_user", "derivedFrom": dec})["id"]
+        self.assertEqual([x["id"] for x in self.item("get", dec)["derivedItems"]], [w])
+        self.assertNotIn(w, [x["id"] for x in self.cli("check")["warnings"] if x["code"] == "waiting-on-resolved-decision"])
+        # 해제할 연결이 없으면 변경이 아니다(rev·이력·빈 키를 남기지 않는다)
+        free = self.item("add", "work", file={"title": "연결 없음", "status": "진행 중", "derivedFrom": ""})
+        self.assertNotIn("derivedFrom", free["item"])
+        again = self.item("set", free["id"], "--set", "derivedFrom=")
+        self.assertTrue(again["unchanged"]); self.assertEqual(again["rev"], 1); self.assertNotIn("derivedFrom", again["item"])
+        # 해제는 빈 값이며 역방향도 사라진다
+        self.item("set", kid, "--set", "derivedFrom=")
+        self.assertNotIn(kid, [x["id"] for x in self.item("get", b)["derivedItems"]])
+        # 대상이 사라진 연결(손 편집)은 check 경고다
+        raw = rd(self.data); raw["work"][0]["derivedFrom"] = "w-00000000"; wr(self.data, raw)
+        self.assertEqual([x["id"] for x in self.cli("check")["warnings"] if x["code"] == "relation-target-missing"], [a])
+
     # ---------- check / summary ----------
     def tree(self):
         out = {}
@@ -1207,7 +1972,8 @@ class T(unittest.TestCase):
     def test_summary_markdown_hidden_and_legacy(self):
         self.get("/api/dashboard")
         ids = self.ids(); w0, w1 = ids["work"]  # A: 진행 중(legacy), B: 완료(legacy 문구)
-        n = self.item("add", "work", "--set", "title=숨긴 미완료 /Users/me/x run_123abc", "--set", "status=진행 중", "--set", "remaining=DEMO-42 확인")
+        local_path = os.path.join(os.sep, "Users", "fixture", "project")
+        n = self.item("add", "work", "--set", f"title=숨긴 미완료 {local_path} run_000abc", "--set", "status=진행 중", "--set", "remaining=DEMO-42 확인")
         closed = self.item("add", "work", "--set", "title=끝난 일", "--set", "status=진행 중")
         self.item("set", closed["id"], "--set", "state=closed", "--reason", "사용자 종료")
         self.post(self.req(("work", n["id"]))); self.cli("process-inbox")
@@ -1226,7 +1992,7 @@ class T(unittest.TestCase):
         self.assertEqual([x["id"] for x in self.cli("summary")["legacyDoneByStatus"]], [w1, ids["question"]])
         self.assertIn(f"- {refs[w0]} [작업] 합성 작업 A", md)  # legacy 미완료는 그대로
         self.assertIn(f"- {refs[ids['decision']]} [결정] 합성 결정", md)
-        for leak in ("비밀 메시지 원문", "/Users/me", "run_123abc"):
+        for leak in ("비밀 메시지 원문", local_path, "run_000abc"):
             self.assertNotIn(leak, md)
         active = md.split("## 진행 중")[1].split("##")[0]
         order = [l.split()[1] for l in active.splitlines() if l.startswith("- HQ-")]

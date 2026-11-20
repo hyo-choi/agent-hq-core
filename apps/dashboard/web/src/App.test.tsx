@@ -27,11 +27,280 @@ beforeEach(() => {
     return new Response(JSON.stringify({ [field]: body, duplicate: false }), { status: 201 });
   }));
 });
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 const refresh = () => act(async () => { document.dispatchEvent(new Event('visibilitychange')); await new Promise(r => setTimeout(r, 0)); });
 const tabBtn = (name: string) => screen.getAllByRole('tab').find(b => b.textContent!.startsWith(name))!;
 
 describe('App', () => {
+  for (const provider of ['codex', 'claude']) it(`${provider} 알림은 실제 수신·확인 시점을 보장하지 않는다`, async () => {
+    const now = new Date().toISOString();
+    snap.flush = { registration: { provider, threadName: '합성 세션', registeredAt: now },
+      recent: [{ flushId: 'pending', status: 'queued', threadName: '합성 세션', createdAt: now, active: true }], cooldownSec: 60 };
+    sessionStorage.setItem('tab', '"inbox"');
+    render(<App />);
+    expect(await screen.findByText(/실제 수신·확인 시점은 보장하지 않습니다/)).toBeTruthy();
+    expect(screen.queryByText(/쉬고 있으면 바로|작업이 끝난 뒤 확인합니다/)).toBeNull();
+    expect(screen.getByText(/완료 기록으로 확인해 주세요/)).toBeTruthy();
+  });
+
+  it('이미지 안내는 hover와 고정 열기, Escape 및 바깥 누르기로 닫힌다', async () => {
+    sessionStorage.setItem('tab', '"inbox"');
+    render(<App />);
+    const b = await screen.findByRole('button', { name: '이미지 첨부 안내' });
+    fireEvent.mouseEnter(b);
+    expect(b.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(b);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(b.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(b);
+    expect(b.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.pointerDown(document.body);
+    expect(b.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('button', { name: /최신화 요청|자원 정리 요청/ })).toBeNull();
+  });
+
+  it('같은 이름으로 재등록하면 이전 queued 요청이 새 버튼을 막지 않는다', async () => {
+    snap.flush = { registration: { provider: 'codex', threadName: '합성 세션', registeredAt: '2030-02-02T00:00:00Z' },
+      recent: [{ flushId: 'old', status: 'queued', threadName: '합성 세션', createdAt: '2030-02-01T00:00:00Z', active: false }], cooldownSec: 60 };
+    vi.spyOn(Date, 'now').mockReturnValue(new Date('2030-02-03T00:00:00Z').getTime());
+    sessionStorage.setItem('tab', '"inbox"');
+    render(<App />);
+    const b = await screen.findByRole('button', { name: '지금 확인 요청' });
+    expect(b.hasAttribute('disabled')).toBe(false);
+    vi.restoreAllMocks();
+  });
+
+  it('이미지 선택·붙여 넣기·드롭·제거와 한도를 적용하고 이미지 전송을 같은 번호로 재시도한다', async () => {
+    sessionStorage.setItem('tab', '"requests"');
+    // 독립 초안 키로 기존 텍스트 재시도 테스트와 전송 상태를 공유하지 않는다.
+    snap.data.work = [{ id: 'w-images', title: '이미지 테스트', status: '진행 중' }];
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["m:w-images"]');
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const original = (fetch as any).getMockImplementation(), uploads: any[] = [];
+    (fetch as any).mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === 'api/uploads') { uploads.push(init); return new Response(JSON.stringify({ upload: { id: 'a'.repeat(32) } }), { status: 201 }); }
+      return original(url, init);
+    });
+    render(<App />);
+    const ta = await screen.findByLabelText('후속 질문: 이미지 테스트');
+    const wrap = ta.parentElement!, picker = wrap.querySelector('input[type=file]')!;
+    const png = () => new File(['png'], 'sample.png', { type: 'image/png' });
+    fireEvent.change(picker, { target: { files: [png()] } });
+    expect(await screen.findByAltText('첨부 미리보기 1')).toBeTruthy();
+    fireEvent.paste(ta, { clipboardData: { files: [png()] } });
+    fireEvent.drop(wrap, { dataTransfer: { files: [png()] } });
+    expect(screen.getAllByAltText(/첨부 미리보기/)).toHaveLength(3);
+    fireEvent.click(screen.getByLabelText('첨부 2 제거'));
+    expect(screen.getAllByAltText(/첨부 미리보기/)).toHaveLength(2);
+    fireEvent.change(picker, { target: { files: [new File(['bad'], 'bad.svg', { type: 'image/svg+xml' }), new File([new Uint8Array(5 * 1024 * 1024 + 1)], 'big.png', { type: 'image/png' }), ...Array.from({ length: 5 }, png)] } });
+    expect(screen.getAllByAltText(/첨부 미리보기/)).toHaveLength(6);
+    expect(screen.getByText(/bad.svg: PNG/).textContent).toContain('최대 6장');
+    // 한 장만 남겨 전송 실패 후 업로드를 반복하지 않는지 확인한다.
+    for (let i = 6; i > 1; i--) fireEvent.click(screen.getByLabelText(`첨부 ${i} 제거`));
+    postFail = 1;
+    fireEvent.click([...wrap.querySelectorAll('button')].find(b => b.textContent === '보내기')!);
+    await screen.findByText(/보내지 못했습니다/);
+    fireEvent.click(screen.getByText('다시 보내기'));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(uploads).toHaveLength(1);
+    expect(posts[0][1].messageId).toBe(posts[1][1].messageId);
+    expect(posts[1][1]).toMatchObject({ text: '', attachments: ['a'.repeat(32)] });
+    await waitFor(() => expect(screen.queryByAltText('첨부 미리보기 1')).toBeNull());
+    vi.restoreAllMocks();
+  });
+
+  it('응답 유실 후 글을 고치면 보존한 File로 새 업로드와 새 메시지를 만든다', async () => {
+    snap.data.work = [{ id: 'w-edit-image', title: '첨부 수정', status: '진행 중' }];
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["m:w-edit-image"]');
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:edit'); vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const original = (fetch as any).getMockImplementation(), uploads: { key: string; file: unknown }[] = [], accepted: any[] = [];
+    (fetch as any).mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === 'api/uploads') {
+        uploads.push({ key: (init!.headers as Record<string, string>)['X-Upload-Key'], file: init!.body });
+        return new Response(JSON.stringify({ upload: { id: String(uploads.length).repeat(32) } }), { status: 201 });
+      }
+      if (url === 'api/messages') {
+        const body = JSON.parse(String(init!.body)); accepted.push(body);
+        if (accepted.length === 1) throw new Error('응답 유실');
+        if (accepted[0].attachments[0] === body.attachments[0]) return new Response(JSON.stringify({ error: '이미 연결됨' }), { status: 409 });
+      }
+      return original(url, init);
+    });
+    render(<App />);
+    const ta = await screen.findByLabelText('후속 질문: 첨부 수정') as HTMLTextAreaElement, wrap = ta.parentElement!;
+    const file = new File(['png'], 'edit.png', { type: 'image/png' });
+    fireEvent.change(wrap.querySelector('input[type=file]')!, { target: { files: [file] } });
+    fireEvent.input(ta, { target: { value: '원문' } });
+    fireEvent.click([...wrap.querySelectorAll('button')].find(b => b.textContent === '보내기')!);
+    await screen.findByText(/응답 유실/);
+    fireEvent.input(ta, { target: { value: '고친 글' } });
+    fireEvent.click(screen.getByText('다시 보내기'));
+    await waitFor(() => expect(accepted).toHaveLength(2));
+    expect(accepted[1].messageId).not.toBe(accepted[0].messageId);
+    expect(accepted[1].attachments).not.toEqual(accepted[0].attachments);
+    expect(uploads[1].key).not.toBe(uploads[0].key);
+    expect(uploads[1].file).toBe(uploads[0].file);
+    await waitFor(() => expect(ta.value).toBe(''));
+    vi.restoreAllMocks();
+  });
+
+  it('메시지 카드의 원본 이미지 링크와 만료 안내를 표시한다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["m:w-1","mx:images-card"]');
+    snap.messages = [{ messageId: 'images-card', kind: 'work', itemId: 'w-1', text: '', label: '작업 하나', status: 'received',
+      attachments: [{ id: 'a'.repeat(32), type: 'image/png', size: 3, available: true }, { id: 'b'.repeat(32), type: 'image/jpeg', size: 3, available: false }] }];
+    render(<App />);
+    const img = await screen.findByAltText('첨부 이미지 1');
+    expect(img.closest('a')?.getAttribute('href')).toBe('api/uploads/' + 'a'.repeat(32));
+    expect(img.closest('a')?.getAttribute('target')).toBe('_blank');
+    expect(screen.getByText(/보관 기간이 지나 삭제됨/)).toBeTruthy();
+  });
+
+  it('질문 답변과 추천 본문에도 소제목 규칙을 적용하고 빈 검증은 생략한다', async () => {
+    snap.data.questions = [{ id: 'q-fold', q: '질문 접기', status: '조사 중', answer: '### 알아 두실 점\n질문 정보\n\n### 필요한 결정\n질문 선택' }];
+    snap.data.recommendations = { updatedAt: new Date().toISOString(), items: [{ id: 'rec-fold', title: '추천 접기', why: '### 배경\n추천 정보', action: '### 정해 주실 것\n추천 행동' }] };
+    sessionStorage.setItem('tab', '"home"');
+    render(<App />);
+    const fold = (title: string) => screen.getByText(title, { selector: 'summary > span:first-child' }).closest('details') as HTMLDetailsElement;
+    await screen.findByText('배경', { selector: 'summary > span:first-child' });
+    expect(fold('배경').open).toBe(false);
+    expect(fold('정해 주실 것').open).toBe(true);
+    fireEvent.click(tabBtn('질문'));
+    await screen.findByText('알아 두실 점', { selector: 'summary > span:first-child' });
+    expect(fold('알아 두실 점').open).toBe(true);
+    expect(fold('필요한 결정').open).toBe(true);
+    fireEvent.click(tabBtn('작업'));
+    await screen.findByText('작업 하나', { selector: 'h3' });
+    expect(screen.queryByText('검증', { selector: 'summary > span:first-child' })).toBeNull();
+  });
+  it('기본 펼침 본문과 사용자가 펼친 본문을 상세 모두 닫기로 닫고 재마운트에도 유지한다', async () => {
+    snap.data.recommendations = { items: [{ id: 'rec-close', title: '접기 검증', why: '### 다음 행동\n행동 본문\n\n### 배경\n정보 본문' }] };
+    const { unmount } = render(<App />);
+    await screen.findByText('다음 행동', { selector: 'summary > span:first-child' });
+    const fold = (name: string) => screen.getByText(name, { selector: 'summary > span:first-child' }).closest('details') as HTMLDetailsElement;
+    await waitFor(() => expect((screen.getByText('상세 모두 닫기') as HTMLButtonElement).disabled).toBe(false));
+    await act(async () => { fold('배경').open = true; fireEvent(fold('배경'), new Event('toggle')); });
+    fireEvent.click(screen.getByText('상세 모두 닫기'));
+    await waitFor(() => expect([fold('다음 행동').open, fold('배경').open]).toEqual([false, false]));
+    unmount(); render(<App />);
+    await screen.findByText('다음 행동', { selector: 'summary > span:first-child' });
+    expect([fold('다음 행동').open, fold('배경').open]).toEqual([false, false]);
+  });
+  it('직접 확인할 제목과 하위 행동 제목에 배지를 표시하고 Shift+X 뒤에도 구분을 유지한다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["d:w-1"]');
+    snap.data.work[0].conclusion = '### [확인해 주실 것](https://example.com/check)\n직접 행동\n\n### 배경\n정보 본문\n\n### 검토 결과\n#### 다음 행동\n하위 행동';
+    snap.data.work[0].verification = '### 필요한 결정\n검증 안의 제목';
+    render(<App />);
+    await screen.findByText('배경', { selector: 'summary > span:first-child' });
+    const folds = () => [...document.querySelectorAll<HTMLDetailsElement>('[data-md-fold]')];
+    const assertMarkers = () => {
+      expect(folds().map(d => !!d.querySelector('summary .badge'))).toEqual([true, false, true, false]);
+      expect(folds().map(d => d.querySelector('summary')!.classList.contains('text-base-content/60'))).toEqual([false, true, false, true]);
+      for (const d of [folds()[0], folds()[2]]) expect(d.querySelector('summary .sr-only')!.textContent).toBe('직접 확인할 섹션');
+      const link = folds()[0].querySelector('summary a')!;
+      expect([link.getAttribute('href'), link.getAttribute('target')]).toEqual(['https://example.com/check', '_blank']);
+    };
+    expect(folds().map(d => d.open)).toEqual([true, false, true, false]);
+    assertMarkers();
+    fireEvent.keyDown(document, { key: 'X', shiftKey: true });
+    await waitFor(() => expect(folds().every(d => !d.open)).toBe(true));
+    assertMarkers();
+  });
+  it('바깥 상세는 실제 행동 섹션 수를 표시하고 모두 닫은 뒤에도 남기며 정보성 카드에는 생략한다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["d:w-1"]');
+    snap.data.work[0].conclusion = '### 확인해 주실 것\n행동\n\n### 검토 결과\n#### 다음 행동\n하위 행동\n#### 꼭 확인\n같은 섹션';
+    snap.data.work[0].remaining = '### 추천\n다음 작업';
+    snap.data.work[0].verification = '### 필요한 결정\n검증은 정보성';
+    snap.data.work.push({ id: 'w-info', title: '정보성 작업', status: '진행 중', conclusion: '### 배경\n정보', verification: '### 필요한 결정\n검증 제목' });
+    render(<App />);
+    await screen.findByText('정보성 작업', { selector: 'h3' });
+    const summary = (id: string) => document.querySelector(`[data-item="${id}"] details > summary`)!;
+    const check = () => {
+      expect(summary('w-1').querySelector('.badge [aria-hidden]')!.textContent).toBe('확인 3');
+      expect(summary('w-1').querySelector('.sr-only')!.textContent).toBe('직접 확인할 섹션 3개');
+      expect(summary('w-info').querySelector('.badge')).toBeNull();
+    };
+    check();
+    fireEvent.keyDown(document, { key: 'X', shiftKey: true });
+    await waitFor(() => expect((summary('w-1').parentElement as HTMLDetailsElement).open).toBe(false));
+    check();
+    snap.data.work[0].conclusion = '### 배경\n변경된 정보'; snap.data.work[0].remaining = '';
+    await refresh();
+    expect(summary('w-1').querySelector('.badge')).toBeNull();
+  });
+  it('질문 답변과 미결·완료 결정의 바깥 상세에도 같은 섹션 수를 표시한다', async () => {
+    snap.data.questions = [{ id: 'q-action', q: '행동 질문', status: '조사 중', answer: '### 배경\n정보\n### 검토\n#### 다음 행동\n행동' }];
+    snap.data.pendingDecisions[0].detail = '### 필요한 결정\n결정';
+    snap.data.pendingDecisions[0].waiting = '### 선택지\n선택';
+    snap.data.resolvedDecisions[0].detail = '### 알아 두실 점\n결정 결과';
+    sessionStorage.setItem('tab', '"question"');
+    render(<App />);
+    await screen.findByText('Q. 행동 질문', { selector: 'h3' });
+    const count = (id: string) => document.querySelector(`[data-item="${id}"] details > summary .badge [aria-hidden]`)!.textContent;
+    expect(count('q-action')).toBe('확인 1');
+    fireEvent.click(tabBtn('결정'));
+    await screen.findByText('대기 결정', { selector: 'h3' });
+    expect(count('d-1')).toBe('확인 2');
+    expect(count('d-0000dec1')).toBe('확인 1');
+  });
+  it('긴 본문은 소제목별 기본값과 검증 전체 접힘을 적용하고 갱신·재마운트 후 사용자 선택을 유지한다', async () => {
+    sessionStorage.setItem('tab', '"work"'); sessionStorage.setItem('open', '["d:w-1"]');
+    snap.data.work[0].conclusion = '항상 보이는 서문\n\n### 해 주실 일\n직접 행동\n\n### 배경\n정보 본문';
+    snap.data.work[0].verification = '검증 본문\n\n### 검증 근거\n전체 블록 안의 글';
+    snap.data.work[0].remaining = '소제목 없는 남은 일';
+    const { unmount } = render(<App />);
+    await screen.findByText('항상 보이는 서문');
+    const fold = (name: string) => screen.getByText(name, { selector: 'summary > span:first-child' }).closest('details') as HTMLDetailsElement;
+    expect(fold('해 주실 일').open).toBe(true);
+    expect(fold('배경').open).toBe(false);
+    expect(fold('검증').open).toBe(false);
+    expect(screen.getByText('검증 근거').tagName).toBe('H3');
+    expect(screen.getByText('소제목 없는 남은 일').closest('[data-md-fold]')).toBeNull();
+    const toggle = (name: string, on: boolean) => { const d = fold(name); d.open = on; fireEvent(d, new Event('toggle')); };
+    toggle('해 주실 일', false); toggle('배경', true); toggle('검증', true);
+    await refresh();
+    expect(fold('해 주실 일').open).toBe(false);
+    expect(fold('배경').open).toBe(true);
+    expect(fold('검증').open).toBe(true);
+    unmount(); render(<App />);
+    await screen.findByText('항상 보이는 서문');
+    expect(fold('해 주실 일').open).toBe(false);
+    expect(fold('배경').open).toBe(true);
+    expect(fold('검증').open).toBe(true);
+  });
+  it('검색 중에는 접힌 상세와 본문을 펼치고 검색을 지우면 원래 선택으로 돌아간다', async () => {
+    sessionStorage.setItem('tab', '"work"');
+    snap.data.work[0].conclusion = '### 배경\n숨은 검색어';
+    snap.data.work[0].verification = '검색어 검증';
+    render(<App />);
+    await screen.findByText('배경', { selector: 'summary > span:first-child' });
+    const folds = () => [...document.querySelectorAll<HTMLDetailsElement>('[data-item="w-1"] details:has(dl), [data-item="w-1"] details[data-md-fold]')];
+    expect(folds().every(d => !d.open)).toBe(true);
+    const search = screen.getByPlaceholderText('제목·내용·HQ 번호 검색');
+    fireEvent.input(search, { target: { value: '검색어' } });
+    await waitFor(() => expect(folds().every(d => d.open)).toBe(true));
+    await refresh();
+    expect(folds().every(d => d.open)).toBe(true);
+    fireEvent.input(search, { target: { value: '' } });
+    await waitFor(() => expect(folds().every(d => !d.open)).toBe(true));
+  });
+  it('통합 검색의 보기 이동은 접힌 본문과 상위 상세를 모두 열어 내용을 찾게 한다', async () => {
+    location.hash = '#search';
+    snap.data.pendingDecisions[0].detail = '### 배경\n숨은 결정 근거';
+    render(<App />);
+    const search = await screen.findByPlaceholderText('작업·질문·PR·결정 전체에서 제목·내용·HQ·PR 번호 검색');
+    fireEvent.input(search, { target: { value: '숨은 결정 근거' } });
+    fireEvent.click(await screen.findByRole('button', { name: '결정 탭에서 보기: 대기 결정' }));
+    await waitFor(() => {
+      const folds = [...document.querySelectorAll<HTMLDetailsElement>('[data-item="d-1"] details:has(dl), [data-item="d-1"] details[data-md-fold]')];
+      expect(folds.length).toBe(2);
+      expect(folds.every(d => d.open)).toBe(true);
+    });
+    await refresh();
+    expect(document.querySelector<HTMLDetailsElement>('[data-md-fold]')!.open).toBe(true);
+  });
+
+
   it('Jira Sprint 묶음 안에서 일반 티켓·서브태스크·유형 미확인을 나누고 부모 번호만 링크로 붙인다', async () => {
     const iss = (key: string, extra: object) => ({ key, summary: key + ' 제목', status: 'READY', priority: 'High', sprint: 1, sprintIds: [1], ...extra });
     snap.data.jira = { site: 'https://x.atlassian.net', project: 'DEMO', sprintField: 'customfield_10001', observedAt: new Date().toISOString(),
@@ -466,7 +735,7 @@ describe('App', () => {
     });
   }
   // 우측 하단 진입점: 요청함과 같은 초안·전송 상태를 쓴다
-  const fab = () => document.querySelector('button.btn-circle[aria-expanded]') as HTMLButtonElement;  // Alerts 접기 버튼도 aria-expanded라 원형 버튼으로 좁힌다
+  const fab = () => document.querySelector('button.btn-circle.btn-lg[aria-expanded]') as HTMLButtonElement;  // Alerts 접기 버튼도 aria-expanded라 원형 버튼으로 좁힌다
   const panelTa = () => document.querySelector('[role=dialog][aria-label="메시지 보내기"] textarea') as HTMLTextAreaElement;
   const inboxTa = () => [...document.querySelectorAll('#list textarea[aria-label="새 자유 메시지"]')][0] as HTMLTextAreaElement;
 
@@ -536,7 +805,7 @@ describe('App', () => {
     const panel = () => document.querySelector('[role=dialog][aria-label="메시지 보내기"]')!;
     const flushBtn = () => [...panel().querySelectorAll('button')].find(b => b.textContent === '지금 확인 요청') as HTMLButtonElement;
     expect(flushBtn().disabled).toBe(false);
-    snap.flush = { ...snap.flush, recent: [{ status: 'queued', createdAt: now, threadName: 'coord' }] };
+    snap.flush = { ...snap.flush, recent: [{ status: 'queued', createdAt: now, threadName: 'coord', active: true }] };
     await act(async () => { fireEvent.click(flushBtn()); await new Promise(r => setTimeout(r, 0)); });
     await waitFor(() => expect(posts.length).toBe(1));
     expect(posts[0][0]).toBe('api/flush');
@@ -592,6 +861,53 @@ describe('App', () => {
     render(<App />);
     fireEvent.click(await screen.findByLabelText('관련 HQ-40 목록에 없음, 이유 보기'));
     expect(await screen.findByText(/merged로 확인된 PR이라/)).toBeTruthy();
+  });
+  it('파생 관계는 원본·파생 카드 양쪽에서 서로 이동한다(저장은 파생 쪽 하나)', async () => {
+    snap.data.work.push({ id: 'w-2', title: '파생 작업', status: '진행 중', derivedFrom: 'w-1' });
+    snap.data.questions = [{ id: 'q-1', q: '파생 질문', status: '조사 중', derivedFrom: 'w-1' }];
+    snap.refs['w-2'] = 'HQ-3'; snap.refs['q-1'] = 'HQ-4';
+    sessionStorage.setItem('tab', '"work"');
+    render(<App />);
+    await screen.findByText('파생 작업');
+    const rel = (id: string) => [...document.querySelectorAll(`[data-item="${id}"] [data-related]`)].map(b => b.getAttribute('data-related'));
+    expect(rel('w-1')).toEqual(['w-2', 'q-1']);
+    expect(rel('w-2')).toEqual(['w-1']);
+    fireEvent.click(screen.getByLabelText('파생 HQ-4 질문 탭에서 보기: 파생 질문'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="q-1"]')?.classList.contains('ring-2')).toBe(true));
+    expect(sessionStorage.getItem('tab')).toBe('"question"');
+    fireEvent.click(screen.getByLabelText('원본 HQ-1 작업 탭에서 보기: 작업 하나'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="w-1"]')?.classList.contains('ring-2')).toBe(true));
+    expect(sessionStorage.getItem('tab')).toBe('"work"');
+    fireEvent.input(screen.getByPlaceholderText('제목·내용·HQ 번호 검색'), { target: { value: '작업 하나' } });  // 필터에 걸린 대상은 HQ 번호 검색으로 찾는다
+    await waitFor(() => expect(document.querySelector('[data-item="w-2"]')).toBeNull());
+    fireEvent.click(screen.getByLabelText('파생 HQ-3 작업 탭에서 보기: 파생 작업'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="w-2"]')?.classList.contains('ring-2')).toBe(true));
+    expect((screen.getByPlaceholderText('제목·내용·HQ 번호 검색') as HTMLInputElement).value).toBe('HQ-3');
+  });
+  it('결정 완료 카드도 파생 관계로 오가고, 숨긴 원본은 되살리지 않으며 연결 없는 카드에는 버튼이 없다', async () => {
+    snap.data.work.push({ id: 'w-2', title: '결정 파생', status: '진행 중', derivedFrom: 'd-0000dec1' }, { id: 'w-3', title: '숨은 원본 파생', status: '진행 중', derivedFrom: 'w-gone' }, { id: 'w-4', title: '번호 없는 원본', status: '진행 중', derivedFrom: 'w-noref' });
+    snap.refs['w-2'] = 'HQ-3'; snap.refs['w-3'] = 'HQ-5'; snap.refs['w-4'] = 'HQ-6'; snap.refs['w-gone'] = 'HQ-7';
+    snap.requests = [{ requestId: 'r', status: 'done', items: [{ kind: 'work', id: 'w-gone', label: 'x' }] }];
+    sessionStorage.setItem('tab', '"work"');
+    render(<App />);
+    await screen.findByText('결정 파생');
+    expect(document.querySelector('[data-item="w-1"] [data-relations]')).toBeNull();
+    expect(document.querySelector('[data-item="w-4"] [data-related]')).toBeNull();  // HQ 번호 없는 id는 버튼 없음
+    fireEvent.click(screen.getByLabelText('원본 HQ-7 목록에 없음, 이유 보기'));
+    expect(await screen.findByText(/삭제 요청으로 진행판에서 숨긴 항목/)).toBeTruthy();
+    expect(sessionStorage.getItem('tab')).toBe('"work"');
+    fireEvent.click(screen.getByLabelText('원본 HQ-30 결정 탭에서 보기: 합성 결정 통합'));  // 접힌 결정 완료 묶음을 펼쳐 보여 준다
+    await waitFor(() => expect(document.querySelector('#list [data-item="d-0000dec1"]')?.classList.contains('ring-2')).toBe(true));
+    fireEvent.click(screen.getByLabelText('파생 HQ-3 작업 탭에서 보기: 결정 파생'));
+    await waitFor(() => expect(document.querySelector('#list [data-item="w-2"]')?.classList.contains('ring-2')).toBe(true));
+  });
+  it('숨긴 결정 완료 파생 항목은 원본 카드에 나오지 않는다', async () => {
+    snap.data.resolvedDecisions[0].derivedFrom = 'w-1';
+    snap.requests = [{ requestId: 'r', status: 'done', items: [{ kind: 'decision', id: 'd-0000dec1', label: 'x' }] }];
+    sessionStorage.setItem('tab', '"work"');
+    render(<App />);
+    await screen.findByText('작업 하나');
+    expect(document.querySelector('[data-item="w-1"] [data-relations]')).toBeNull();
   });
   it('추천의 관련 항목이 숨김이면 되살리지 않고 이유만 안내한다', async () => {
     snap.data.recommendations = { items: [{ id: 'rec-h', title: '숨김 관련', related: ['d-0000dec1'] }] };
