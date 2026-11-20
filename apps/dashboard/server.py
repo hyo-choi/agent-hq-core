@@ -29,7 +29,7 @@
 코드는 Git(apps/dashboard)에, 실행 데이터(public/data.json, private/)는 HQ_DASH_ROOT(기본 ~/.local/share/agent-hq-core)에 둔다.
 외부 연동은 모두 끔이 기본이다: HQ_GITHUB_REPO(PR 조회), HQ_JIRA_PROJECT(Jira 스냅샷), HQ_ENABLE_CODEX_FLUSH=1(Codex 알림), HQ_TASKS_DIR(task 문서 대조).
 """
-import argparse, fcntl, hashlib, json, math, os, re, secrets, socket, subprocess, sys, tempfile, threading, time
+import argparse, fcntl, hashlib, json, math, os, re, secrets, socket, stat, subprocess, sys, tempfile, threading, time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +41,11 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 ASSETS = os.path.join(HERE, "public")  # index.html·app.css는 코드와 함께 Git에 있다
 PUBLIC = os.path.join(ROOT, "public")
 PRIVATE = os.path.join(ROOT, "private")
+CAPTURES = os.path.join(os.path.realpath(ROOT), "captures")
+CAPTURE_NAME_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}")
+CAPTURE_TYPES = {"html": "text/html; charset=utf-8", "png": "image/png", "jpg": "image/jpeg",
+                 "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif",
+                 "json": "application/json; charset=utf-8"}
 DATA = os.path.join(PUBLIC, "data.json")
 STATE = os.path.join(PRIVATE, "state.json")
 LOCK = os.path.join(PRIVATE, ".lock")
@@ -1040,6 +1045,8 @@ class Handler(BaseHTTPRequestHandler):
             if content is not None:
                 return self.send_body(200, content, a["type"], upload=True)
             return self.send_body(404, {"error": "보관 기간이 지나 삭제됐거나 없는 이미지입니다"}, upload=True)
+        if path.startswith("/captures/"):
+            return self.send_capture(path)
         if path in STATIC:  # ponytail: 정확한 경로 allowlist라 경로 탈출 여지가 없다
             name, ctype = STATIC[path]
             with open(os.path.join(ASSETS, name), "rb") as f:
@@ -1059,6 +1066,25 @@ class Handler(BaseHTTPRequestHandler):
                     write_json(FLUSH, box)
             return self.send_body(200, view(data, state))
         self.send_body(404, {"error": "not found"})
+
+    def send_capture(self, path):
+        # URL을 디코딩하지 않아 인코딩된 구분자·점도 허용 목록에서 거절한다.
+        parts = path[len("/captures/"):].split("/")
+        if len(parts) == 2 and CAPTURE_NAME_RE.fullmatch(parts[0]):
+            folder, name = parts[0], parts[1] or "index.html"
+            if CAPTURE_NAME_RE.fullmatch(name):
+                ctype = CAPTURE_TYPES.get(name.rsplit(".", 1)[-1]) if "." in name else None
+                resolved = os.path.realpath(os.path.join(CAPTURES, folder, name))
+                # captures 자체나 내부 심볼릭 링크가 다른 실행 데이터를 가리켜도 노출하지 않는다.
+                if ctype and os.path.commonpath((CAPTURES, resolved)) == CAPTURES and os.path.isfile(resolved):
+                    try:
+                        with open(resolved, "rb") as f:
+                            if stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                                return self.send_body(200, f.read(), ctype, capture=True)
+                    except OSError:
+                        pass
+        return self.send_body(404, {"error": "not found"}, capture=True)
+
 
     def do_POST(self):
         accept = {"/api/requests": accept_request, "/api/messages": accept_message, "/api/flush": accept_flush}.get(self.path)

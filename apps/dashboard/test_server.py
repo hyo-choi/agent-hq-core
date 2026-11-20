@@ -349,7 +349,7 @@ s.Handler.setup = setup
         paced_post("/api/messages", json.dumps({"messageId": secrets.token_hex(16), "kind": "general", "text": "p" * 1400}).encode(), 200)
         folder = os.path.join(self.root, "captures", "paced"); os.makedirs(folder)
         with open(os.path.join(folder, "image.png"), "wb") as f: f.write(raw)
-        for path in ("/api/uploads/" + uid,):
+        for path in ("/api/uploads/" + uid, "/captures/paced/image.png"):
             with self.subTest(path=path), socket.socket() as conn:
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024)
                 conn.settimeout(3); conn.connect(("127.0.0.1", self.port))
@@ -415,7 +415,7 @@ s.Handler.log_message = log
         self.post(msg, path="/api/messages")
         folder = os.path.join(self.root, "captures", "slow"); os.makedirs(folder)
         with open(os.path.join(folder, "large.png"), "wb") as f: f.write(raw)
-        for path in ("/api/uploads/" + uid,):
+        for path in ("/api/uploads/" + uid, "/captures/slow/large.png"):
             with self.subTest(path=path), socket.socket() as conn:
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
                 conn.settimeout(3); conn.connect(("127.0.0.1", self.port))
@@ -593,6 +593,75 @@ s.Handler.log_message = log
             self.assertEqual(run("check").returncode, 0)
         finally:
             shutil.rmtree(tmp)
+
+    def test_capture_files_and_headers(self):
+        folder = os.path.join(self.root, "captures", "sample-gallery")
+        os.makedirs(folder)
+        types = {"index.html": "text/html; charset=utf-8", "photo.png": "image/png",
+                 "photo.jpg": "image/jpeg", "photo.jpeg": "image/jpeg", "photo.webp": "image/webp",
+                 "photo.gif": "image/gif", "info.json": "application/json; charset=utf-8"}
+        for name, ctype in types.items():
+            content = ("capture " + name).encode()
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(content)
+            paths = ["/captures/sample-gallery/" + name]
+            if name == "index.html":
+                paths.append("/captures/sample-gallery/")
+            for path in paths:
+                with self.subTest(path=path), urllib.request.urlopen(self.base + path) as r:
+                    self.assertEqual(r.status, 200)
+                    self.assertEqual(r.read(), content)
+                    self.assertEqual(r.headers["Content-Type"], ctype)
+                    self.assertEqual(r.headers["Content-Security-Policy"], "sandbox allow-scripts")
+                    self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+                    self.assertEqual(r.headers["Cache-Control"], "no-store")
+        with open(os.path.join(folder, "index.html"), "wb") as f:
+            f.write(b"replaced")
+        self.assertEqual(self.get("/captures/sample-gallery/")[1], b"replaced")
+
+    def test_capture_path_rejections(self):
+        folder = os.path.join(self.root, "captures", "demo")
+        os.makedirs(folder)
+        for name in ("index.html", ".hidden.html", "secret.txt", "json"):
+            with open(os.path.join(folder, name), "w") as f:
+                f.write("must not escape")
+        os.makedirs(os.path.join(folder, "nested"))
+        os.makedirs(os.path.join(self.root, "backups"), exist_ok=True)
+        wr(os.path.join(self.root, "private", "secret.json"), {"secret": True})
+        os.symlink(self.data, os.path.join(folder, "outside.json"))
+        os.symlink(os.path.join(self.root, "private"), os.path.join(self.root, "captures", "outside"))
+        for path in ("/captures/", "/captures/demo", "/captures/missing/", "/captures/demo/missing.png",
+                     "/captures/../public/data.json", "/captures/demo/../index.html",
+                     "/captures/%2e%2e/data.json", "/captures/demo/%2e%2e", "/captures/demo/%252e%252e",
+                     "/captures/demo/%2fprivate%2fsecret.json", "/captures//demo/index.html",
+                     "/captures/demo//index.html", "/captures/demo//etc/passwd", "/captures/demo/.hidden.html",
+                     "/captures/.hidden/index.html", "/captures/demo/secret.txt", "/captures/demo/json",
+                     "/captures/demo/nested/index.html", "/captures/demo/nested", "/captures/demo/outside.json",
+                     "/captures/outside/secret.json", "/captures/" + "a" * 129 + "/",
+                     "/captures/demo/" + "a" * 129 + ".html", "/captures/demo/index.html/",
+                     "/private/secret.json", "/public/data.json", "/backups/", "/data.json"):
+            with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(self.base + path)
+            self.assertEqual(err.exception.code, 404, path)
+        # captures 자체가 다른 실행 데이터로 향하는 심볼릭 링크인 경우도 거절한다.
+        shutil.rmtree(os.path.join(self.root, "captures"))
+        os.makedirs(os.path.join(self.root, "private", "demo"))
+        wr(os.path.join(self.root, "private", "demo", "secret.json"), {"secret": True})
+        os.symlink(os.path.join(self.root, "private"), os.path.join(self.root, "captures"))
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(self.base + "/captures/demo/secret.json")
+        self.assertEqual(err.exception.code, 404)
+        os.unlink(os.path.join(self.root, "captures"))
+
+    def test_capture_opaque_origin_cannot_post(self):
+        # sandbox allow-scripts 문서의 POST Origin은 문자열 null이다. 확장을 허용해도 동일하다.
+        for extra in ((),):
+            self.stop(); self.start(*extra)
+            for path in ("/api/messages", "/api/requests", "/api/flush"):
+                code, _ = self.post({}, origin="null", path=path, site="cross-site")
+                self.assertEqual(code, 403, path)
+                self.assertEqual(self.post({}, origin="null", path=path)[0], 403, path)
+        self.assertEqual(self.cli("msg", "list")["messages"], [])
 
     def test_static_allowlist(self):
         self.assertEqual(self.get("/")[0], 200)
