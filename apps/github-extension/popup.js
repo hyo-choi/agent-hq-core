@@ -1,4 +1,5 @@
 import * as L from "./lib.js";
+import { ImageDraft } from "./images.js";
 
 const $ = (id) => document.getElementById(id);
 const say = (text, err = false) => {
@@ -24,11 +25,17 @@ let pr, dash, view, key;
 let comment = null; // 댓글 버튼으로 열었을 때의 대상 댓글(permalink·작성자·인용)
 let draft = { value: null, text: "", attempt: null }; // flush: 사용자가 바꾼 "지금 확인 요청" 선택(없으면 기본으로 켠다)
 let saving = Promise.resolve();
+const images = new ImageDraft();
+let sending = false;
 
-// popup은 포커스를 잃으면 닫힌다. 초안과 재시도 키를 브라우저 세션 동안 메모리에 둔다.
-const save = () => (saving = saving.catch(() => {}).then(() => chrome.storage.session.set({ [key]: { ...draft, comment } }))); // 한 번 실패해도 다음 저장을 막지 않는다
+// popup은 포커스를 잃으면 닫힌다. 텍스트 초안과 텍스트 전송의 재시도 키는 브라우저 세션 동안 보관한다.
+const save = () => {
+  // File과 업로드 재시도 키는 popup 수명 동안만 유지한다. 텍스트 초안은 기존 세션 저장소에 남긴다.
+  const snapshot = { ...draft, attempt: images.items.length ? null : draft.attempt, comment };
+  return (saving = saving.catch(() => {}).then(() => chrome.storage.session.set({ [key]: snapshot })));
+}; // 한 번 실패해도 다음 저장을 막지 않는다
 const target = () => view.targets.find((t) => t.value === $("target").value);
-const compose = () => L.composeText(target(), $("text").value, pr, comment);
+const compose = () => L.composeText(target(), $("text").value, pr, comment, images.items.length > 0);
 
 function renderTargets() {
   const sel = $("target");
@@ -37,14 +44,17 @@ function renderTargets() {
   $("note").textContent = view.registered ? "" : pr.jira ? "이 티켓의 키와 주소가 담긴 자유 메시지로 보내며 coordinator가 분류합니다." : "진행판에서 이 PR을 찾지 못했습니다. 자유 메시지로 보내면 coordinator가 분류합니다.";
 }
 
-function refreshControls(sending = false) {
+function refreshControls(busy = false) {
+  sending = busy;
+  for (const id of ["attach", "picker"]) $(id).disabled = busy;
+  for (const b of $("images").querySelectorAll("button")) b.disabled = busy;
   const block = comment || pr.jira ? null : L.rebaseBlock(dash, pr, view.entry);
   const text = compose();
   $("rebase").disabled = sending || !!block;
   $("review").disabled = sending;
   $("rebaseNote").textContent = block || "";
   $("count").textContent = `${text.length} / ${L.MSG_MAX}`;
-  $("send").disabled = sending || !text || text.length > L.MSG_MAX;
+  $("send").disabled = sending || (!text && !images.items.length) || text.length > L.MSG_MAX;
   const reg = dash.flush?.registration;
   $("flush").disabled = sending || !reg;
   if (!reg) $("flush").checked = false;
@@ -63,6 +73,8 @@ async function finish(attempt, note) {
   }
   // 실패 뒤 글을 고쳐 두고 다시 연 경우, 이전 시도가 접수됐어도 고친 글은 지우지 않는다
   const kept = compose() === attempt.text ? "" : $("text").value;
+  images.clear();
+  renderImages();
   draft = { value: kept ? draft.value : null, text: kept, attempt: null, flush: draft.flush }; // 끝난 뒤에는 PR 카드 기본으로 돌아간다. 확인 요청 선택은 유지한다
   await save();
   dash.messages = [...(dash.messages || []), { messageId: attempt.messageId, status: "received", text: attempt.text }]; // 재조회가 실패해도 리베이스 중복을 막는다
@@ -95,20 +107,69 @@ async function sendNow() {
     const block = L.rebaseBlock(dash, pr, view.entry);
     if (block) return say(block, true);
   }
+  if (sending || (!text && !images.items.length) || text.length > L.MSG_MAX) return;
   const attempt = L.nextAttempt(draft.attempt, t, text, $("flush").checked);
   draft = { ...draft, value: t.value, text: $("text").value, attempt };
   refreshControls(true); // await 전에 막아 연속 클릭이 다시 들어오지 않게 한다
   say("보내는 중…");
-  await save(); // 응답을 잃어도 같은 messageId로 이어 가도록 전송 전에 남긴다
+  await save(); // 텍스트 시도는 세션에, 이미지 시도는 현재 popup 메모리에 남긴다
+  for (const image of images.items) {
+    if (!image.id) {
+      const res = await upload(image);
+      if (!res.ok) {
+        refreshControls();
+        return say(`${res.error}\n쓴 내용은 그대로 있습니다. 고치지 않고 다시 보내면 같은 메시지 번호와 업로드 키를 사용합니다.`, true);
+      }
+      image.id = res.upload.id;
+    }
+  }
+  if (images.items.length) attempt.attachments = images.items.map(a => a.id);
   const res = await call("/api/messages", { body: L.messageBody(attempt), timeout: 10000 });
   if (res.ok) return finish(L.recoverAttempt({ messages: [res.message] }, attempt) || attempt, res.duplicate ? "이미 접수된 메시지입니다" : "접수됐습니다(처리는 coordinator가 합니다)");
-  const rejected = L.definitelyRejected(res.status);
+  const rejected = !images.items.length && L.definitelyRejected(res.status);
   if (rejected) {
     draft.attempt = null; // 저장되지 않았으므로 다음 전송은 새 키를 쓴다
     await save();
   }
   refreshControls();
   say(`${res.error}\n쓴 내용은 그대로 있습니다.${rejected ? "" : " 다시 보내면 중복되지 않습니다."}`, true);
+}
+
+async function upload(image) {
+  try {
+    const r = await fetch(L.API + "/api/uploads", { method: "POST", headers: { "Content-Type": image.file.type, "X-Upload-Key": image.key }, body: image.file, signal: AbortSignal.timeout(125000) });
+    const body = await r.json().catch(() => ({}));
+    return { ...body, ok: r.ok, error: r.ok ? null : L.errorText(r.status, body.error, chrome.runtime.id) };
+  } catch { return { ok: false, error: L.errorText(0) }; }
+}
+
+function changedContent() {
+  if (images.items.length || draft.attempt?.attachments?.length) {
+    images.reset();
+    draft.attempt = null;
+  }
+}
+
+function renderImages() {
+  $("images").replaceChildren(...images.items.map((image, i) => {
+    const box = document.createElement("div"), img = document.createElement("img"), name = document.createElement("div"), remove = document.createElement("button");
+    img.src = image.url; img.alt = `첨부 미리보기 ${i + 1}`;
+    name.textContent = image.file.name;
+    remove.type = "button"; remove.textContent = "제거"; remove.setAttribute("aria-label", `첨부 ${i + 1} 제거`);
+    remove.addEventListener("click", () => {
+      if (sending) return;
+      changedContent(); images.remove(i); save(); renderImages(); refreshControls();
+    });
+    box.append(img, name, remove); return box;
+  }));
+}
+
+function addImages(files) {
+  if (sending) return;
+  const before = images.items.length;
+  const errors = images.add(files);
+  if (before !== images.items.length) { changedContent(); save(); }
+  renderImages(); refreshControls(); say(errors.join(" "), !!errors.length);
 }
 
 // 리베이스·리뷰 문구는 입력칸만 채운다. 보내기는 사용자가 누른다
@@ -127,6 +188,7 @@ function insertReview() {
 
 function toPrCard() {
   $("target").value = view.targets[0].value; // 리베이스·리뷰 처리는 PR 카드로, 미등록이면 자유 메시지로 보낸다
+  changedContent();
   draft.value = $("target").value;
   draft.text = $("text").value;
   save();
@@ -182,9 +244,16 @@ async function main() {
   $("flush").checked = L.initialFlush(draft); // 기본으로 켠다. refreshControls가 등록 없을 때 해제한다
   $("form").hidden = false;
   $("form").addEventListener("submit", send);
+  $("attach").addEventListener("click", () => $("picker").click());
+  $("picker").addEventListener("change", () => { addImages(Array.from($("picker").files)); $("picker").value = ""; });
+  $("form").addEventListener("paste", ev => {
+    const files = Array.from(ev.clipboardData?.files || []);
+    if (files.length) { ev.preventDefault(); addImages(files); }
+  });
   $("rebase").addEventListener("click", insertRebase);
   $("review").addEventListener("click", insertReview);
   $("target").addEventListener("change", () => {
+    changedContent();
     draft.value = $("target").value;
     save();
     refreshControls();
@@ -194,6 +263,7 @@ async function main() {
     save();
   });
   $("text").addEventListener("input", () => {
+    changedContent();
     draft.text = $("text").value;
     save();
     refreshControls();
