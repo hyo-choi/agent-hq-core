@@ -13,7 +13,9 @@ node apps/github-extension/configure.mjs \
   --jira https://example.atlassian.net
 ```
 
-`--jira`는 생략하면 비활성이다. `--api`는 사용자 정보·경로·query·hash 없는 http(s) origin이며, owner는 GitHub 계정/조직 이름 하나다. 서버의 실제 bind·alias·포트와 일치시킨다. 기본 소스의 설정은 비어 있어 popup에 명확한 오류를 표시하고 HTTP 요청을 보내지 않는다. 개인 서버로 향하는 fallback은 없다.
+`--jira`는 생략하면 비활성이다. `--api`는 사용자 정보·경로·query·hash 없는 http(s) origin이며, owner는 GitHub 계정/조직 이름 하나다. 서버의 실제 bind·alias·포트와 일치시킨다. URL은 정규화하기 전부터 단일 ASCII DNS 호스트(예: localhost) 또는 정규 점 표기의 IPv4만 허용하며, 포트는 1~65535의 앞자리 0 없는 십진수만 허용한다. wildcard·물음표·빈 라벨·끝 점·공백·제어 문자·인코딩된 호스트·경로와 경로 정규화 입력은 거절한다. IDN과 punycode(xn-- 라벨)는 표시 혼동을 피하려고 거절하며 IPv6도 이번 구성기의 명시적 지원 범위에서 제외한다. GitHub owner는 ASCII 이름 하나이고 Jira는 같은 호스트 검증을 거친 HTTPS Atlassian 사이트만 허용한다. 생성기는 저장된 manifest를 다시 읽어 입력한 호스트 하나와 owner 하나 외의 권한이 없는지 확인하며, 실패하면 설치 가능한 manifest를 남기지 않는다.
+
+기본 소스의 설정은 비어 있어 popup에 명확한 오류를 표시하고 HTTP 요청을 보내지 않는다. 개인 서버로 향하는 fallback은 없다.
 
 1. 출력된 `apps/github-extension/local/extension` 폴더를 `chrome://extensions`의 개발자 모드에서 Load unpacked로 설치한다. 기본 출력 폴더는 `.gitignore`에 포함된다. `--out <비어있는폴더>`로 다른 위치를 쓸 수도 있으며 생성한 개인 설정을 커밋하지 않는다.
 2. Chrome에 표시된 자신의 확장 ID를 읽는다. manifest에 `key`가 없으므로 폴더 이동 등으로 ID가 달라질 수 있다.
