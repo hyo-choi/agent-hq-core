@@ -282,11 +282,15 @@ with s.locked():
 
     def raw_post(self, path, length, extra="", body=b""):
         conn = socket.create_connection(("127.0.0.1", self.port), timeout=3)
-        conn.sendall((f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: {self.base}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nX-Upload-Key: {secrets.token_hex(16)}\r\n{extra}\r\n").encode() + body)
+        conn.sendall((f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: {getattr(self, 'raw_origin', self.base)}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nX-Upload-Key: {secrets.token_hex(16)}\r\n{extra}\r\n").encode() + body)
         return conn
 
     def test_upload_read_deadline_slots_and_framing(self):
-        self.stop(); self.start(code="s.TRANSFER_IDLE_TIMEOUT = 0.8; s.TRANSFER_TOTAL_TIMEOUT = 1.5")
+        self.check_upload_deadline_slots_and_framing()
+
+    def check_upload_deadline_slots_and_framing(self, ext=None):
+        self.raw_origin = ext or self.base
+        self.stop(); self.start(*(("--ext-origin", ext) if ext else ()), code="s.TRANSFER_IDLE_TIMEOUT = 0.8; s.TRANSFER_TOTAL_TIMEOUT = 1.5")
         for path in ("/api/uploads", "/api/messages"):
             for extra in ("Transfer-Encoding: chunked\r\n", "Content-Length: 1\r\n"):
                 with self.raw_post(path, 99, extra) as conn:
@@ -536,6 +540,119 @@ s.Handler.log_message = log
             urllib.request.urlopen(req)
         self.assertEqual(e.exception.code, 403)
 
+    def test_extension_images_origin_and_validation(self):
+        ext = "chrome-extension://" + "a" * 32
+        self.assertEqual(self.upload(origin=ext)[0], 403)
+        self.stop(); self.start("--ext-origin", ext)
+        key = secrets.token_hex(16)
+        uid = self.upload(origin=ext, key=key, site="cross-site")[1]["upload"]["id"]
+        code, body = self.upload(origin=ext, key=key)
+        self.assertEqual((code, body["duplicate"], body["upload"]["id"]), (200, True, uid))
+        self.assertEqual(self.upload(b"\x89PNG\r\n\x1a\nchanged", origin=ext, key=key)[0], 409)
+        msg = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+        for bad in (False, "chrome-extension://" + "b" * 32, ext + "/", "https://evil.example", "null"):
+            self.assertEqual(self.upload(origin=bad)[0], 403)
+            conn = http.client.HTTPConnection("127.0.0.1", self.port)
+            try:
+                headers = {"Content-Type": "application/json", **({"Origin": bad} if bad else {})}
+                conn.request("POST", "/api/messages", json.dumps(msg), headers)
+                self.assertEqual(conn.getresponse().status, 403)
+            finally:
+                conn.close()
+        self.assertEqual(self.post(msg, origin=ext, ctype="text/plain", path="/api/messages")[0], 415)
+        self.assertEqual(self.post({**msg, "kind": "work", "itemId": "w-missing"}, origin=ext, path="/api/messages")[0], 400)
+        self.assertEqual(self.post(msg, origin=ext, path="/api/messages")[0], 201)
+        self.assertTrue(self.post(msg, origin=ext, path="/api/messages")[1]["duplicate"])
+        self.assertEqual(self.post({**msg, "text": "changed"}, origin=ext, path="/api/messages")[0], 409)
+        self.assertEqual(self.post({**msg, "messageId": secrets.token_hex(16)}, origin=ext, path="/api/messages")[0], 409)
+        for raw in (b"<svg/>", b"GIF89a", b"<html/>"):
+            self.assertEqual(self.upload(raw, origin=ext)[0], 415)
+        self.assertEqual(self.upload(origin=ext, size=5 * 1024 * 1024 + 1)[0], 413)
+        self.assertEqual(self.upload(origin=ext, key="invalid")[0], 400)
+        ids = [self.upload(origin=ext)[1]["upload"]["id"] for _ in range(7)]
+        fresh = {**msg, "messageId": secrets.token_hex(16)}
+        self.assertEqual(self.post({**fresh, "attachments": ids}, origin=ext, path="/api/messages")[0], 400)
+        self.assertEqual(self.post({**fresh, "attachments": ids[:6]}, origin=ext, path="/api/messages")[0], 201)
+        self.assertEqual(self.post({**fresh, "messageId": secrets.token_hex(16), "text": "x" * 17000}, origin=ext, path="/api/messages")[0], 413)
+        with open(os.path.join(self.root, "private", "uploads", "quota.bin"), "wb") as f:
+            f.truncate(256 * 1024 * 1024)
+        self.assertEqual(self.upload(origin=ext)[0], 507)
+
+
+    def test_duplicate_origin_headers_rejected_for_web_and_extension(self):
+        ext, evil = "chrome-extension://" + "a" * 32, "https://evil.example"
+        self.stop(); self.start("--ext-origin", ext)
+        for good in (self.base, ext):
+            for path in ("/api/uploads", "/api/messages", "/api/flush", "/api/requests"):
+                raw = b"\x89PNG\r\n\x1a\nfixture" if path == "/api/uploads" else b"{}"
+                for origins in ((good, evil), (evil, good), (good, good), (), (good + " " + evil,)):
+                    with self.subTest(good=good, path=path, origins=origins):
+                        conn = http.client.HTTPConnection("127.0.0.1", self.port)
+                        try:
+                            conn.putrequest("POST", path)
+                            for origin in origins:
+                                conn.putheader("Origin", origin)
+                            conn.putheader("Content-Type", "application/json")
+                            conn.putheader("Content-Length", str(len(raw)))
+                            conn.putheader("X-Upload-Key", secrets.token_hex(16))
+                            conn.endheaders(raw)
+                            response = conn.getresponse()
+                            self.assertEqual(response.status, 403)
+                            response.read()
+                        finally:
+                            conn.close()
+            # 같은 공통 검사 뒤 정상 화면·확장 요청은 계속 받는다.
+            uid = self.upload(origin=good)[1]["upload"]["id"]
+            msg = {"messageId": secrets.token_hex(16), "kind": "general", "text": "", "attachments": [uid]}
+            self.assertEqual(self.post(msg, origin=good, path="/api/messages")[0], 201)
+
+
+    def test_extension_origin_boundary(self):
+        ext, other = "chrome-extension://" + "a" * 32, "chrome-extension://" + "b" * 32
+        w = self.ids()["work"]
+        msg = lambda: {"messageId": secrets.token_hex(16), "kind": "work", "itemId": w[0], "text": "확장 요청"}
+        flush = lambda: {"flushId": secrets.token_hex(16)}
+        # 기본(미등록)은 어떤 확장도 받지 않는다
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages")[0], 403)
+        self.assertEqual(self.post(flush(), origin=ext, path="/api/flush")[0], 403)
+        self.stop(); self.start("--ext-origin", ext)
+        # Sec-Fetch-Site가 없어도(실측: http 대상) 있어도 정확한 origin이면 메시지·flush를 받는다
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages")[0], 201)
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages", site="none")[0], 201)
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages", site="cross-site")[0], 201)
+        self.assertEqual(self.post(flush(), origin=ext, path="/api/flush")[0], 201)
+        # 숨김 요청은 열지 않는다. 요청함에 아무것도 쌓이지 않는다
+        requests = lambda: rd(os.path.join(self.root, "private", "state.json")).get("requests", [])
+        before = requests()
+        self.assertEqual(self.post(self.req(("work", w[0])), origin=ext)[0], 403)
+        self.assertEqual(requests(), before)
+        # 다른 확장, 비슷한 값, 웹 페이지 origin은 거절한다
+        for bad in (other, ext + "/", ext.upper(), "chrome-extension://" + "a" * 31, "https://github.com", "null"):
+            self.assertEqual(self.post(msg(), origin=bad, path="/api/messages")[0], 403, bad)
+            self.assertEqual(self.post(flush(), origin=bad, path="/api/flush")[0], 403, bad)
+        # 확장 경로도 Content-Type 검사와 항목 검증은 그대로다
+        self.assertEqual(self.post(msg(), origin=ext, path="/api/messages", ctype="text/plain")[0], 415)
+        self.assertEqual(self.post({**msg(), "itemId": "w-없음"}, origin=ext, path="/api/messages")[0], 400)
+        # 같은 messageId 재시도는 한 건, 내용을 바꾸면 409
+        m = msg()
+        self.assertEqual(self.post(m, origin=ext, path="/api/messages")[0], 201)
+        code, body = self.post(m, origin=ext, path="/api/messages")
+        self.assertEqual((code, body["duplicate"]), (200, True))
+        self.assertEqual(self.post({**m, "text": "고친 글"}, origin=ext, path="/api/messages")[0], 409)
+        self.assertEqual(sum(x["messageId"] == m["messageId"] for x in self.get("/api/dashboard")[1]["messages"]), 1)
+        # 기존 화면 origin은 그대로 동작한다
+        self.assertEqual(self.post(msg(), path="/api/messages")[0], 201)
+        # 잘못된 형식이면 서버를 띄우지 않는다
+        out = subprocess.run([sys.executable, os.path.join(HERE, "server.py"), "serve", "--host", "127.0.0.1", "--port", str(free_port()), "--ext-origin", "https://github.com"],
+                             env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("--ext-origin", out.stderr)
+
+
+    def test_extension_upload_deadline_slots_and_framing(self):
+        self.check_upload_deadline_slots_and_framing("chrome-extension://" + "a" * 32)
+
+
     def test_unknown_at_process_time_fails_not_hides(self):
         ids = self.ids()
         b = self.req(("work", ids["work"][0]))
@@ -657,7 +774,7 @@ s.Handler.log_message = log
 
     def test_capture_opaque_origin_cannot_post(self):
         # sandbox allow-scripts 문서의 POST Origin은 문자열 null이다. 확장을 허용해도 동일하다.
-        for extra in ((),):
+        for extra in ((), ("--ext-origin", "chrome-extension://" + "a" * 32)):
             self.stop(); self.start(*extra)
             for path in ("/api/messages", "/api/requests", "/api/flush"):
                 code, _ = self.post({}, origin="null", path=path, site="cross-site")

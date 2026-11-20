@@ -71,6 +71,8 @@ KST = timezone(timedelta(hours=9))
 # 공통 검증 한계(globalLimits, 문자열 목록)는 섹션 전체가 한 항목이다. id는 data.json의 globalLimitsId(g-xxxxxxxx)에 둔다
 LIMITS_ID_RE = re.compile(r"^g-[0-9a-f]{8}$")
 REQ_RE = re.compile(r"^[0-9a-f]{32}$")
+EXT_ORIGIN_RE = re.compile(r"^chrome-extension://[a-p]{32}$")
+EXT_ROUTES = ("/api/messages", "/api/flush", "/api/uploads")  # 숨김 요청은 허용하지 않는다
 MSG_KINDS = ("work", "question", "pr", "decision")  # 공통 한계·추천·Jira에는 메시지를 남기지 않는다
 # 메시지 숨김 요청의 대상 id. 항목 id(w-·q-·d-·pr-·g-)와 겹치지 않게 접두사와 kind "message"로 구분한다
 MSG_PREFIX = "msg-"
@@ -1160,8 +1162,13 @@ class Handler(BaseHTTPRequestHandler):
         is_upload = self.path == "/api/uploads"
         if not accept and not is_upload:
             return self.send_body(404, {"error": "not found"})
-        origin = self.headers.get("Origin")
-        if origin not in self.server.origins or self.headers.get("Sec-Fetch-Site", "same-origin") != "same-origin":
+        origins = self.headers.get_all("Origin", [])
+        if len(origins) != 1:
+            return self.send_body(403, {"error": "Origin 헤더는 정확히 하나여야 합니다"})
+        origin = origins[0]
+        # 브라우저 Origin 경계이며 비브라우저 클라이언트의 인증 수단은 아니다.
+        from_ext = origin in self.server.ext_origins and self.path in EXT_ROUTES
+        if not from_ext and (origin not in self.server.origins or self.headers.get("Sec-Fetch-Site", "same-origin") != "same-origin"):
             return self.send_body(403, {"error": "같은 origin 요청만 허용됩니다"})
         if not is_upload and (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
             return self.send_body(415, {"error": "Content-Type: application/json이 필요합니다"})
@@ -1224,7 +1231,10 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("%s [%s] %s\n" % (self.address_string(), now(), fmt % args))
 
 
-def serve(host, port, aliases=()):
+def serve(host, port, aliases=(), ext_origins=()):
+    for origin in ext_origins:
+        if not EXT_ORIGIN_RE.fullmatch(origin):
+            sys.exit(f"--ext-origin 형식 오류: {origin}")
     if not host.startswith("100.") and host != "127.0.0.1":
         sys.exit("127.0.0.1(기본) 또는 tailnet IP(100.x)에만 bind합니다")
     missing = [k for k, (key, _) in LISTS.items() for o in load_json(DATA).get(key) or [] if not o.get("id")]
@@ -1233,6 +1243,7 @@ def serve(host, port, aliases=()):
     with locked():
         cleanup_uploads()
     httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd.ext_origins = set(ext_origins)
     httpd.upload_slots = threading.BoundedSemaphore(UPLOAD_CONCURRENT)
     # ponytail: 고정 allowlist다. Host 헤더에서 origin을 만들지 않으므로 임의 Host로 우회할 수 없다
     httpd.origins = {f"http://{h}:{port}" for h in (host, *aliases)}
@@ -1781,6 +1792,7 @@ def main(argv=None):
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=48173)
     s.add_argument("--alias", nargs="*", default=[], help="같은 서버를 가리키는 추가 hostname(Origin 허용, 예: localhost)")
     sub.add_parser("init", help="데이터 루트에 빈 data.json(--demo면 합성 예시)을 만든다").add_argument("--demo", action="store_true")
+    s.add_argument("--ext-origin", action="append", default=[], help="메시지·이미지 업로드·flush POST를 허용할 exact 확장 origin. 기본 없음")
     sub.add_parser("migrate-ids")
     s = sub.add_parser("list"); s.add_argument("--all", action="store_true")
     s = sub.add_parser("process-inbox"); s.add_argument("--request", nargs="*")
@@ -1832,7 +1844,7 @@ def main(argv=None):
     if a.cmd not in ("restore",) and not os.path.isfile(DATA):  # 없는 루트를 조용히 만들지 않는다
         sys.exit(f"데이터가 없습니다: {DATA}\n먼저 `python3 server.py init`(빈 상태) 또는 `init --demo`(합성 예시)를 실행하세요")
     if a.cmd == "serve":
-        return serve(a.host, a.port, a.alias)
+        return serve(a.host, a.port, a.alias, a.ext_origin)
     if a.cmd == "migrate-ids":
         out = migrate_ids()
     elif a.cmd == "list":
